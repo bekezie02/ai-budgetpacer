@@ -278,6 +278,8 @@ const ANNUAL_OVERVIEW_SHEET = "Annual Overview";
 const MANDATORY_SECTION_HEADER_ANCHOR = "mandatory non-discretionary annual costs";
 const MANDATORY_FIXED_AMOUNTS_END_LABEL = "Total Annual Mandatory Fixed Amounts";
 const TRAVEL_BUDGET_LABEL = "Total Annual Travel Budget";
+const ACTING_BUDGET_LABEL = "Total Annual Acting Budget";
+const SINKING_FUND_LABEL = "Sinking Fund";
 
 /**
  * Reads every category/budget row between an anchor header (matched by
@@ -359,7 +361,6 @@ function syncFixedPoolBudget(poolName, annualBudget) {
   for(let s of ss.getSheets()) {
     if(s.getName() === FIXED_POOL_PREFIX + poolName) sheet = s; return;
   };
-
   if (!sheet) {
     sheet = ss.insertSheet(FIXED_POOL_PREFIX + poolName);
     sheet.getRange(1, 1, 1, 2).setValues([["Annual Budget", "Remaining Balance"]]);
@@ -394,7 +395,12 @@ function syncFixedPoolsFromAnnualOverview() {
   });
 
   const travelBudget = getLabeledValue(getFinanceSheet(ANNUAL_OVERVIEW_SHEET), TRAVEL_BUDGET_LABEL);
+  const actingBudget = getLabeledValue(getFinanceSheet(ANNUAL_OVERVIEW_SHEET), ACTING_BUDGET_LABEL);
+  const sinkingFund = getLabeledValue(getFinanceSheet(ANNUAL_OVERVIEW_SHEET), SINKING_FUND_LABEL);
+  
   if (travelBudget !== null) syncFixedPoolBudget("Travel", travelBudget);
+  if (actingBudget !== null) syncFixedPoolBudget("Acting", actingBudget);
+  if (sinkingFund !== null) syncFixedPoolBudget("Sinking", sinkingFund);
 }
 
 /**
