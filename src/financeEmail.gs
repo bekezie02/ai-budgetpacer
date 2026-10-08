@@ -337,8 +337,11 @@ Only include entries that clearly reference a transaction ID from the original e
 
   try {
     const clean = result.data.replace(/```json|```/g, "").trim();
-    const data = JSON.parse(clean);
-    if (!Array.isArray(data)) return { success: false, error: "LLM did not return an array" };
+    const parsed = JSON.parse(clean);
+    const data = Array.isArray(parsed) ? parsed : [parsed];
+    if (!data.every(entry => entry && typeof entry === "object" && !Array.isArray(entry))) {
+      return { success: false, error: "LLM did not return transaction assignment objects" };
+    }
     return { success: true, data };
   } catch (e) {
     return { success: false, error: "Failed to parse LLM JSON: " + e.toString() };
@@ -436,4 +439,3 @@ function dailyFinanceCheck() {
     console.warn(`${syncResult.uncategorizedCount} transaction(s) were uncategorized this run — check the Category Rules sheet.`);
   }
 }
-
