@@ -1,6 +1,6 @@
 # AI BudgetPacer (Google Apps Script + Plaid)
 
-**AI BudgetPacer** is a Google Apps Script personal finance tracker that pulls transactions via Plaid, categorizes and ledgers them against an annual budget, and emails a daily deterministic + LLM-narrated summary. Treated as a separate project/repo from the Toolsmith Agent project, even though it currently lives alongside it — it only reuses Toolsmith Agent's `llm()` function.
+**AI BudgetPacer** is a Google Apps Script personal finance tracker that pulls transactions via Plaid, categorizes and ledgers them against an annual budget, and emails a daily deterministic + LLM-narrated summary.
 
 See also: [ARCHITECTUREOVERVIEW.md](./ARCHITECTUREOVERVIEW.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 
@@ -8,7 +8,7 @@ See also: [ARCHITECTUREOVERVIEW.md](./ARCHITECTUREOVERVIEW.md) · [CONTRIBUTING.
 A daily-cron finance tracker: it syncs bank transactions from Plaid, categorizes them against user-defined rules, rolls them up into annual/monthly budget sheets, and emails a summary. Unrecognized transactions go into an "Unknown" bucket that the user resolves by **replying to email**, which the system parses and learns from.
 
 ## Architecture philosophy
-- **Deterministic core, LLM only at the edges.** There is no LLM tool-orchestration/agent loop here (unlike Toolsmith Agent). The LLM is used one-shot, for two things only:
+- **Deterministic core, LLM only at the edges.** There is no LLM tool-orchestration/agent loop here. The LLM is used one-shot, for two things only:
   1. Writing the qualitative email summary/feedback.
   2. Parsing free-form email replies into structured category assignments.
 - All percentages, rollups, and pacing math are computed in code — never left to the LLM.
