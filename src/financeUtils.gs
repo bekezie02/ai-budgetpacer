@@ -1,6 +1,6 @@
-const plaidClientId = properties.getProperty('PLAID_CLIENT_ID')
-const plaidSecret = properties.getProperty('PLAID_SECRET')
-const plaidURL = properties.getProperty('PLAID_URL')
+const plaidClientId = financeScriptProperties.getProperty('PLAID_CLIENT_ID')
+const plaidSecret = financeScriptProperties.getProperty('PLAID_SECRET')
+const plaidURL = financeScriptProperties.getProperty('PLAID_URL')
 const MY_EMAIL = Session.getEffectiveUser().getEmail();
 
 // =========================================================================
@@ -8,10 +8,10 @@ const MY_EMAIL = Session.getEffectiveUser().getEmail();
 // =========================================================================
 function runStep1() {
   try {
-    let user = properties.getProperty('PLAID_USER');
+    let user = financeScriptProperties.getProperty('PLAID_USER');
     if (!user) {
       user = Utilities.getUuid();
-      properties.setProperty('PLAID_USER', user);
+      financeScriptProperties.setProperty('PLAID_USER', user);
     }
     const today = new Date();
     const daysRequested = Math.floor(
@@ -87,16 +87,16 @@ function runStep2() {
     const exchangeData = JSON.parse(exchangeResponse.getContentText());
 
     if (exchangeResponse.getResponseCode() === 200) {
-      let itemIds = properties.getProperty('PLAID_ITEM_IDS');
+      let itemIds = financeScriptProperties.getProperty('PLAID_ITEM_IDS');
       if (!itemIds) itemIds = "[]";
       itemIds = JSON.parse(itemIds);
       if (!itemIds.includes(exchangeData.item_id)) itemIds.push(exchangeData.item_id);
-      properties.setProperty('PLAID_ITEM_IDS', JSON.stringify(itemIds));
+      financeScriptProperties.setProperty('PLAID_ITEM_IDS', JSON.stringify(itemIds));
       // FIXED: only set the access token for the item this exchange was
       // actually for — the old loop assigned this run's new token to every
       // item missing a stored token, which breaks as soon as more than one
       // item has ever been linked.
-      properties.setProperty(`PLAID_ACCESSS_TOKEN_${exchangeData.item_id}`, exchangeData.access_token);
+      financeScriptProperties.setProperty(`PLAID_ACCESSS_TOKEN_${exchangeData.item_id}`, exchangeData.access_token);
 
       return { status: "success" };
     } else {
@@ -196,8 +196,8 @@ function llm(prompt, options) {
   // per-request context budget, so it shouldn't be used to shrink this.
   const MAX_COMPLETION_TOKENS = options.maxCompletionTokens || 1200;
 
-  const groqKey = properties.getProperty("GROQ_API_KEY");
-  const groqUrl = properties.getProperty("GROQ_URL");
+  const groqKey = financeScriptProperties.getProperty("GROQ_API_KEY");
+  const groqUrl = financeScriptProperties.getProperty("GROQ_URL");
 
   const payload = {
     model: "openai/gpt-oss-20b",

@@ -414,9 +414,9 @@ function sendFinanceSummaryEmail() {
   const threadId = sendFinanceEmail(htmlBody, snapshot.monthName);
 
   if (unknownSection) {
-    properties.setProperty('FINANCE_REPLY_THREAD_ID', threadId || "");
+    financeScriptProperties.setProperty('FINANCE_REPLY_THREAD_ID', threadId || "");
   } else {
-    properties.deleteProperty('FINANCE_REPLY_THREAD_ID');
+    financeScriptProperties.deleteProperty('FINANCE_REPLY_THREAD_ID');
   }
 }
 

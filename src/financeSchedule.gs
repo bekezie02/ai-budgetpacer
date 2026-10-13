@@ -159,12 +159,12 @@ function extractNewReplyOnly(messageObject) {
 // email right away rather than waiting for tomorrow's cron.
 // =========================================================================
 function checkForCategoryReplies() {
-  const threadId = properties.getProperty('FINANCE_REPLY_THREAD_ID');
+  const threadId = financeScriptProperties.getProperty('FINANCE_REPLY_THREAD_ID');
   if (!threadId) return; // nothing outstanding to watch for
 
   const thread = GmailApp.getThreadById(threadId);
   if (!thread) {
-    properties.deleteProperty('FINANCE_REPLY_THREAD_ID');
+    financeScriptProperties.deleteProperty('FINANCE_REPLY_THREAD_ID');
     return;
   }
 

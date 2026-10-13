@@ -1,8 +1,8 @@
 // =========================================================================
 // CONFIGURATION
 // =========================================================================
-const properties = PropertiesService.getScriptProperties();
-const FINANCE_SPREADSHEET_NAME = properties.getProperty('FINANCE_SPREADSHEET_NAME');
+const financeScriptProperties = PropertiesService.getScriptProperties();
+const FINANCE_SPREADSHEET_NAME = financeScriptProperties.getProperty('FINANCE_SPREADSHEET_NAME');
 const LIFESTYLE_SHEET = "Monthly LifeStyle Cost";
 const MANDATORY_SHEET = "Monthly Mandatory Cost";
 const LEDGER_SHEET = "Transaction Ledger";
@@ -917,7 +917,7 @@ function applyTransaction(txn, isRemoval) {
 // DAILY SYNC ORCHESTRATION
 // =========================================================================
 function runDailyFinanceSync() {
-  const itemIds = JSON.parse(properties.getProperty('PLAID_ITEM_IDS') || "[]");
+  const itemIds = JSON.parse(financeScriptProperties.getProperty('PLAID_ITEM_IDS') || "[]");
   let hasChanges = false;
   let uncategorizedCount = 0;
 
@@ -931,7 +931,7 @@ function runDailyFinanceSync() {
   const TIME_BUDGET_MS = 5 * 60 * 1000; // 5 minutes
 
   for (const itemId of itemIds) {
-    const accessToken = properties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`);
+    const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`);
     if (!accessToken) continue;
 
     // Captured once, before this item's pagination begins — the recovery
@@ -941,7 +941,7 @@ function runDailyFinanceSync() {
     // guidance is to restart pagination from wherever this session started,
     // not from "" (a full resync from the beginning of history) and not
     // from wherever it broke.
-    const sessionStartCursor = properties.getProperty(`PLAID_CURSOR_${itemId}`) || "";
+    const sessionStartCursor = financeScriptProperties.getProperty(`PLAID_CURSOR_${itemId}`) || "";
     let currentCursor = sessionStartCursor;
 
     let hasMore = true;
@@ -990,7 +990,7 @@ function runDailyFinanceSync() {
       // timeout — the loop was refetching the identical page every
       // iteration since currentCursor never changed.
       currentCursor = syncData.next_cursor;
-      properties.setProperty(`PLAID_CURSOR_${itemId}`, syncData.next_cursor);
+      financeScriptProperties.setProperty(`PLAID_CURSOR_${itemId}`, syncData.next_cursor);
       hasMore = syncData.has_more;
     }
 
@@ -1014,20 +1014,20 @@ function runDailyFinanceSync() {
 // The Gmail reply thread and existing spreadsheet data are left untouched.
 // =========================================================================
 function resyncTransactionsFromStart() {
-  const itemIds = JSON.parse(properties.getProperty('PLAID_ITEM_IDS') || "[]");
+  const itemIds = JSON.parse(financeScriptProperties.getProperty('PLAID_ITEM_IDS') || "[]");
   if (itemIds.length === 0) {
     throw new Error("Cannot re-sync transactions: no linked Plaid items were found.");
   }
 
   const missingTokens = itemIds.filter(itemId =>
-    !properties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`)
+    !financeScriptProperties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`)
   );
   if (missingTokens.length > 0) {
     throw new Error(`Cannot re-sync transactions: missing access token(s) for Plaid item(s): ${missingTokens.join(", ")}.`);
   }
 
   itemIds.forEach(itemId => {
-    properties.deleteProperty(`PLAID_CURSOR_${itemId}`);
+    financeScriptProperties.deleteProperty(`PLAID_CURSOR_${itemId}`);
   });
 
   console.log(`Plaid cursors cleared for ${itemIds.length} linked item(s). Starting sync from the beginning of each item's available history. Gmail reply thread and spreadsheet data were not cleared.`);
@@ -1049,14 +1049,14 @@ function resyncTransactionsFromStart() {
 // the new spreadsheet).
 // =========================================================================
 function startFreshFinanceSheet(newSpreadsheetName) {
-  properties.setProperty('FINANCE_SPREADSHEET_NAME', newSpreadsheetName);
+  financeScriptProperties.setProperty('FINANCE_SPREADSHEET_NAME', newSpreadsheetName);
 
-  const itemIds = JSON.parse(properties.getProperty('PLAID_ITEM_IDS') || "[]");
+  const itemIds = JSON.parse(financeScriptProperties.getProperty('PLAID_ITEM_IDS') || "[]");
   itemIds.forEach(itemId => {
-    properties.deleteProperty(`PLAID_CURSOR_${itemId}`);
+    financeScriptProperties.deleteProperty(`PLAID_CURSOR_${itemId}`);
   });
 
-  properties.deleteProperty('FINANCE_REPLY_THREAD_ID');
+  financeScriptProperties.deleteProperty('FINANCE_REPLY_THREAD_ID');
 
   console.log(`Finance target switched to "${newSpreadsheetName}". Cursors cleared for ${itemIds.length} item(s) — the next sync will pull full available history, filtered to ${SYNC_START_DATE} onward.`);
 }
