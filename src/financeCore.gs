@@ -1168,6 +1168,22 @@ function stagePlaidReplacementTransaction(sheet, txn, duplicateIndex, rowByTrans
 }
 
 function stagePendingPlaidItemTransactions() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    return {
+      status: "in_progress",
+      item_id: financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID")
+    };
+  }
+
+  try {
+    return stagePendingPlaidItemTransactionsLocked();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function stagePendingPlaidItemTransactionsLocked() {
   const itemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   if (!itemId) throw new Error("There is no newly linked Plaid Item waiting for replacement review.");
 
@@ -1194,7 +1210,7 @@ function stagePendingPlaidItemTransactions() {
   sheet.getRange(3, 2).setValue("Staging in progress");
   while (hasMore) {
     if (Date.now() - startTime > TIME_BUDGET_MS) {
-      sheet.getRange(3, 2).setValue("More pages remain; run stagePendingPlaidItemTransactions() again to continue");
+      sheet.getRange(3, 2).setValue("More pages remain; automatic staging will resume on the next inbox trigger");
       return { status: "in_progress", item_id: itemId };
     }
 
@@ -1336,6 +1352,9 @@ function finalizePlaidItemReplacement() {
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_LAST_ERROR");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET_ID");
   let reviewSheetDeleted = false;
   let reviewSheetDeleteError = null;
   try {
@@ -1398,6 +1417,9 @@ function cancelPlaidItemReplacement() {
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_LINK_STARTED_AT");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_LINK_LAST_ERROR");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_LAST_ERROR");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET_ID");
   financeScriptProperties.deleteProperty("PLAID_LINK_MODE");
   CacheService.getScriptCache().remove("CURRENT_LINK_TOKEN");
   if (reviewSheet) getFinanceSpreadsheet().deleteSheet(reviewSheet);

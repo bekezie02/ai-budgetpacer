@@ -157,6 +157,7 @@ function checkInboxForTriggers() {
   }
 
   checkPendingPlaidReplacementLink();
+  checkPendingPlaidReplacementStaging();
   checkPendingPlaidReplacementApproval();
 }
 
@@ -170,7 +171,7 @@ function checkPendingPlaidReplacementLink() {
     financeScriptProperties.deleteProperty('PLAID_REPLACEMENT_LINK_LAST_ERROR');
     const itemId = financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID');
     if (!itemId) throw new Error("Plaid reported replacement success, but the pending Item ID is missing.");
-    sendPlaidReplacementReviewEmail(itemId, outcome.message);
+    Logger.log(`Plaid Item ${itemId} linked; transaction staging will run automatically.`);
     return;
   }
 
@@ -184,13 +185,54 @@ function checkPendingPlaidReplacementLink() {
   }
 }
 
+function checkPendingPlaidReplacementStaging(linkMessage) {
+  const itemId = financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID');
+  if (!itemId) return;
+  if (
+    financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_ITEM_ID') === itemId &&
+    financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_THREAD_ID')
+  ) return;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return;
+
+  try {
+    const currentItemId = financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID');
+    if (!currentItemId || currentItemId !== itemId) return;
+    if (
+      financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_ITEM_ID') === itemId &&
+      financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_THREAD_ID')
+    ) return;
+
+    const result = stagePendingPlaidItemTransactionsLocked();
+    if (result.status === "in_progress") return;
+
+    financeScriptProperties.deleteProperty('PLAID_REPLACEMENT_STAGING_LAST_ERROR');
+    sendPlaidReplacementReviewEmail(itemId, linkMessage);
+  } catch (error) {
+    const message = error.message || String(error);
+    if (financeScriptProperties.getProperty('PLAID_REPLACEMENT_STAGING_LAST_ERROR') !== message) {
+      MailApp.sendEmail({
+        to: MY_EMAIL,
+        subject: "❌ Plaid Item Replacement Staging Needs Attention",
+        body:
+          `Automatic staging could not continue for Plaid Item ${itemId}:\n${message}\n\n` +
+          `The scheduled trigger will retry. You can also run stagePendingPlaidItemTransactions() manually.`
+      });
+      financeScriptProperties.setProperty('PLAID_REPLACEMENT_STAGING_LAST_ERROR', message);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function sendPlaidReplacementReviewEmail(itemId, linkMessage) {
   const subject = `Plaid Replacement Review: ${itemId}`;
   const reviewSheet = getPlaidReplacementReviewSheet(itemId);
   const reviewUrl = `${getFinanceSpreadsheet().getUrl()}#gid=${reviewSheet.getSheetId()}`;
-  const body = `${linkMessage}\n\n` +
+  const body = `${linkMessage || `Transaction staging is complete for Plaid Item ${itemId}.`}\n\n` +
     `Review the staged transactions here: ${reviewUrl}\n` +
-    `After staging is complete, enter the old active Item ID in cell B1. Decision is pre-filled: a unique exact date, amount, and description match is REPLACE <old transaction ID>; all other transactions default to IMPORT. Change IMPORT to SKIP in column A for any transaction you do not want to import. ` +
+    `All available transactions for the current-year window have been staged. Enter the old active Item ID in cell B1. Decision is pre-filled: a unique exact date, amount, and description match is REPLACE <old transaction ID>; all other transactions default to IMPORT. Change IMPORT to SKIP in column A for any transaction you do not want to import. ` +
     `Status REVIEW flags rows with multiple possible matches in column K; check these carefully because their default IMPORT could create a duplicate. REPLACE removes the old Ledger/Unknown entry before applying the new Item's transaction ID. ` +
     `Then reply to this email with exactly:\nFINALIZE ${itemId}\n\n` +
     `The replacement will not be finalized until every staged transaction has a valid decision.\n\n` +

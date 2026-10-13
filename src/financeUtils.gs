@@ -156,7 +156,7 @@ function runStep2() {
         return {
           status: "success",
           item_id: exchangeData.item_id,
-          message: `New Item staged for review in "${reviewSheet.getName()}". Run stagePendingPlaidItemTransactions() to fetch its transactions.`
+          message: `New Item connected. Its transactions are being staged automatically in "${reviewSheet.getName()}". A review email will arrive when staging is complete.`
         };
       }
 
