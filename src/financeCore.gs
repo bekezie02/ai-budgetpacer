@@ -107,7 +107,11 @@ function categorizeTransaction(txn, rules) {
     const pfcOk = !rule.pfcMatch || pfcPrimary.includes(rule.pfcMatch);
     const pfcDetailedOk = !rule.pfcDetailedMatch || pfcDetailed.includes(rule.pfcDetailedMatch);
     if (merchantOk && pfcOk && pfcDetailedOk) {
-      return { targetSheet: rule.targetSheet, targetField: rule.targetField };
+      const fixedPoolName = getFixedPoolNameForTarget(rule.targetSheet);
+      return {
+        targetSheet: fixedPoolName ? `FixedPool:${fixedPoolName}` : rule.targetSheet,
+        targetField: rule.targetField
+      };
     }
   }
   return null; // uncategorized — stored in the Unknown bucket, not guessed at
@@ -359,10 +363,7 @@ function getCategoryBudgetsForSheet(sheetName) {
 function syncFixedPoolBudget(poolName, annualBudget) {
   if (annualBudget === null || annualBudget === undefined) return;
   const ss = getFinanceSpreadsheet();
-  let sheet = null;
-  for(let s of ss.getSheets()) {
-    if(s.getName() === FIXED_POOL_PREFIX + poolName) sheet = s; return;
-  };
+  let sheet = ss.getSheetByName(FIXED_POOL_PREFIX + poolName);
   if (!sheet) {
     sheet = ss.insertSheet(FIXED_POOL_PREFIX + poolName);
     sheet.getRange(1, 1, 1, 2).setValues([["Annual Budget", "Remaining Balance"]]);
@@ -597,6 +598,23 @@ function adjustFixedPool(poolName, txn, delta) {
   sheet.getRange(2, 2).setValue(annualBudget - spent);
 }
 
+function getFixedPoolNameForTarget(targetSheet) {
+  const target = String(targetSheet || "").trim();
+  const fixedPoolPrefix = "FixedPool:";
+  if (target.startsWith(fixedPoolPrefix)) {
+    const poolName = target.slice(fixedPoolPrefix.length).trim();
+    return poolName || null;
+  }
+  if (target.startsWith(FIXED_POOL_PREFIX)) {
+    const poolName = target.slice(FIXED_POOL_PREFIX.length).trim();
+    return poolName || null;
+  }
+
+  return getFinanceSpreadsheet().getSheetByName(FIXED_POOL_PREFIX + target)
+    ? target
+    : null;
+}
+
 // =========================================================================
 // UNKNOWN BUCKET (Uncategorized Transactions) — for any transaction no
 // Category Rule matches. Kept in sync via the same add/modify/remove
@@ -807,7 +825,7 @@ function resolveUnknownTransaction(txnId, targetSheet, targetField) {
   // adjustFieldAmount() no longer recomputes the annual rollup per call
   // (see its comment) — do it once here instead, covering the primary
   // transaction and every swept-up match in one pass.
-  if (!String(targetSheet).startsWith("FixedPool:") && targetSheet.toLowerCase() !== IGNORE_TARGET_SHEET.toLowerCase()) {
+  if (!getFixedPoolNameForTarget(targetSheet) && targetSheet.toLowerCase() !== IGNORE_TARGET_SHEET.toLowerCase()) {
     recomputeAnnualRollup(getFinanceSheet(targetSheet), targetSheet);
   }
 
@@ -833,8 +851,9 @@ function applyResolvedTransaction(txn, targetSheet, targetField) {
     return { success: false, error: `Could not determine month from stored date "${txn.date}" for transaction ${txn.transaction_id}.` };
   }
 
-  if (String(targetSheet).startsWith("FixedPool:")) {
-    adjustFixedPool(targetSheet.split(":")[1], txn, txn.amount);
+  const fixedPoolName = getFixedPoolNameForTarget(targetSheet);
+  if (fixedPoolName) {
+    adjustFixedPool(fixedPoolName, txn, txn.amount);
   } else {
     const result = adjustFieldAmount(targetSheet, monthName, targetField, txn.amount);
     if (!result.success) return result;
@@ -855,8 +874,9 @@ function applyTransaction(txn, isRemoval) {
 
   if (isRemoval) {
     if (prevInfo) {
-      if (String(prevInfo.targetSheet).startsWith("FixedPool:")) {
-        adjustFixedPool(prevInfo.targetSheet.split(":")[1], txn, null);
+      const previousFixedPoolName = getFixedPoolNameForTarget(prevInfo.targetSheet);
+      if (previousFixedPoolName) {
+        adjustFixedPool(previousFixedPoolName, txn, null);
       } else {
         adjustFieldAmount(prevInfo.targetSheet, prevInfo.monthName, prevInfo.targetField, -Number(prevInfo.amount));
       }
@@ -874,7 +894,7 @@ function applyTransaction(txn, isRemoval) {
   // Modified/added: reverse the previous effect first if this transaction
   // was already applied before (fixed pools handle their own overwrite by
   // transaction ID, so no separate reversal is needed there).
-  if (prevInfo && !String(prevInfo.targetSheet).startsWith("FixedPool:")) {
+  if (prevInfo && !getFixedPoolNameForTarget(prevInfo.targetSheet)) {
     adjustFieldAmount(prevInfo.targetSheet, prevInfo.monthName, prevInfo.targetField, -Number(prevInfo.amount));
   }
 
@@ -901,8 +921,9 @@ function applyTransaction(txn, isRemoval) {
 
   const { monthName, year } = getMonthYearFromDate(txn.date);
 
-  if (categorization.targetSheet.startsWith("FixedPool:")) {
-    adjustFixedPool(categorization.targetSheet.split(":")[1], txn, txn.amount);
+  const fixedPoolName = getFixedPoolNameForTarget(categorization.targetSheet);
+  if (fixedPoolName) {
+    adjustFixedPool(fixedPoolName, txn, txn.amount);
   } else {
     const result = adjustFieldAmount(categorization.targetSheet, monthName, categorization.targetField, txn.amount);
     if (!result.success) {
@@ -1231,6 +1252,8 @@ function finalizePlaidItemReplacement() {
       throw new Error(`Set Decision to IMPORT, SKIP, or REPLACE <suggested old transaction ID> for every staged transaction. First invalid or unresolved decision: ${PLAID_REPLACEMENT_DATA_START_ROW + i}.`);
     }
   }
+
+  syncFixedPoolsFromAnnualOverview();
 
   let hasChanges = false;
   rows.forEach((row, index) => {

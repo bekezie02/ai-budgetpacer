@@ -17,6 +17,7 @@ A daily-cron finance tracker: it syncs bank transactions from Plaid, categorizes
 - **401k** is pre-tax/invisible to Plaid and intentionally not tracked.
 - **Brokerage/Roth IRA** transfers could be tracked but deliberately aren't — no budget tension to reconcile, just a known fixed transfer.
 - **Category Rules** are AND-matched across three Plaid fields (Merchant Name Contains, Plaid Category primary, Plaid Category detailed) plus a Target Sheet/Field, so the same merchant can route differently depending on context (e.g. Target for groceries vs. office supplies), and loan-payment types (credit card vs. mortgage vs. student/personal loan) can be told apart.
+- For fixed pools, use `FixedPool:<pool name>` as the Category Rules target (for example, `FixedPool:Travel`). Existing rules or Ledger entries using a pool's bare name (for example, `Travel`) are recognized as that pool when its `Fixed - Travel` sheet exists.
 - A rule's Target Sheet can be `"Ignore"` — matching transactions (e.g. credit card payments, already counted when the original purchase posted) are skipped entirely: not tracked, not ledgered, not sent to Unknown.
 - Resolving an Unknown transaction auto-creates a matching Category Rule (if one doesn't already exist), so repeat merchants stop needing a reply.
 
