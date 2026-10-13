@@ -13,6 +13,11 @@ function runStep1() {
       user = Utilities.getUuid();
       properties.setProperty('PLAID_USER', user);
     }
+    const today = new Date();
+    const daysRequested = Math.floor(
+      (Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()) -
+        Date.UTC(today.getFullYear(), 0, 1)) / 86400000
+    ) + 1;
     const payload = {
       "client_id": plaidClientId,
       "secret": plaidSecret,
@@ -22,8 +27,8 @@ function runStep1() {
       "country_codes": ["US"],
       "language": "en",
       "transactions": {
-      "days_requested": 243
-    },
+        "days_requested": daysRequested
+      },
       "hosted_link": {}
     };
 

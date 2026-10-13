@@ -49,9 +49,8 @@ This project runs on Google Apps Script, so configuration lives in **Script Prop
 | `PLAID_ENV` (e.g. `sandbox`/`development`/`production`) | Which Plaid environment to hit | Yes |
 | `GROQ_API_KEY` | Auth for the shared `llm()` (summary writing, reply parsing) | Yes |
 | `FINANCE_SPREADSHEET_NAME` | Points the script at the active finance spreadsheet; repointed by `startFreshFinanceSheet()` | Yes |
-| `SYNC_START_DATE` | Bounds how far back Plaid sync pulls history (e.g. Jan 1 of current year) | Yes |
 
-> Note: property names above reflect the project's known architecture (`FINANCE_SPREADSHEET_NAME` and `SYNC_START_DATE` are confirmed from project notes; Plaid/Groq credential names are the conventional Plaid/Groq naming and should be confirmed against your live Script Properties).
+> Note: `SYNC_START_DATE` is calculated in code and is not a Script Property. The Plaid/Groq credential names are conventional and should be confirmed against your live Script Properties. `runStep1()` calculates the number of days from January 1 through today when creating a Plaid Link token, so the current date is never hardcoded.
 
 ## Deploy your own copy
 
