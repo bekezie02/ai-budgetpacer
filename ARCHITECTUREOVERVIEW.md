@@ -37,4 +37,5 @@ For newcomers to the codebase. See [README.md](./README.md) for a high-level sum
 ## Performance/reliability notes for contributors
 - Rollup recompute (`recomputeAnnualRollup()`, a full-sheet scan) is intentionally run once per sync/reply, not per-transaction — running it per-transaction previously caused large backlog syncs to hit Apps Script's 6-minute execution limit before the cursor saved, stalling sync at the same point every run.
 - A 5-minute time-budget guard in `runDailyFinanceSync` checkpoints the cursor between pages as extra protection.
+- Plaid Item replacements use `startPlaidItemReplacementLink()`, `stagePendingPlaidItemTransactions()`, and `finalizePlaidItemReplacement()` so a new connection's transactions are reviewed before the active Item ID/token is swapped. Potential overlap suggestions are informational; reviewers choose which staged rows to import or skip.
 - Date handling: Sheets silently converts a written `"YYYY-MM-DD"` string into a real Date object, which can break re-deriving a transaction's month. `getMonthYearFromDate()` handles both string and Date input, with guards that return a clear error instead of crashing.

@@ -11,6 +11,8 @@ const UNKNOWN_SHEET = "Uncategorized Transactions";
 const UNKNOWN_TARGET = "Unknown";
 const FIXED_POOL_PREFIX = "Fixed - ";
 const FIXED_POOL_LEDGER_START_ROW = 5;
+const PLAID_REPLACEMENT_REVIEW_PREFIX = "Plaid Review ";
+const PLAID_REPLACEMENT_DATA_START_ROW = 7;
 let financeSpreadsheetCache = null;
 
 // Only transactions on/after this date get applied to the sheets — added,
@@ -1006,6 +1008,263 @@ function runDailyFinanceSync() {
   }
 
   return { hasChanges, uncategorizedCount };
+}
+
+function getPlaidReplacementReviewSheet(itemId) {
+  const ss = getFinanceSpreadsheet();
+  let sheetName = financeScriptProperties.getProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
+  if (!sheetName) {
+    const safeItemId = String(itemId).replace(/[\[\]*\/\\?:]/g, "_").slice(0, 80);
+    sheetName = `${PLAID_REPLACEMENT_REVIEW_PREFIX}${safeItemId}`;
+    financeScriptProperties.setProperty("PLAID_REPLACEMENT_REVIEW_SHEET", sheetName);
+  }
+
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    sheet.getRange(1, 1, 4, 2).setValues([
+      ["Old Item ID to replace (fill before finalizing)", ""],
+      ["New Item ID", itemId],
+      ["Staging status", "Ready to stage transactions"],
+      ["Instructions", "Review each transaction against existing sheets; set Decision to IMPORT or SKIP before finalizing."]
+    ]);
+    sheet.getRange(6, 1, 1, 11).setValues([[
+      "Decision", "Status", "Transaction ID", "Date", "Amount", "Description",
+      "Merchant Name", "PFC Primary", "PFC Detailed", "Account ID",
+      "Possible Existing Transaction IDs"
+    ]]);
+    sheet.setFrozenRows(6);
+  }
+  return sheet;
+}
+
+function normalizeReplacementDate(dateValue) {
+  return dateValue instanceof Date
+    ? Utilities.formatDate(dateValue, Session.getScriptTimeZone(), "yyyy-MM-dd")
+    : String(dateValue);
+}
+
+function getReplacementDuplicateIndex() {
+  const index = {};
+  const add = (date, amount, description, txnId) => {
+    const signature = [
+      normalizeReplacementDate(date),
+      String(Number(amount)),
+      String(description || "").trim().toLowerCase()
+    ].join("|");
+    if (!index[signature]) index[signature] = [];
+    index[signature].push(String(txnId));
+  };
+
+  const ledger = getFinanceSheet(LEDGER_SHEET);
+  if (ledger.getLastRow() >= 2) {
+    ledger.getRange(2, 1, ledger.getLastRow() - 1, 4).getValues().forEach(row => {
+      add(row[1], row[2], row[3], row[0]);
+    });
+  }
+
+  const unknown = getFinanceSheet(UNKNOWN_SHEET);
+  if (unknown.getLastRow() >= 2) {
+    unknown.getRange(2, 1, unknown.getLastRow() - 1, 6).getValues().forEach(row => {
+      add(row[1], row[3], row[2], row[0]);
+    });
+  }
+  return index;
+}
+
+function stagePlaidReplacementTransaction(sheet, txn, duplicateIndex, rowByTransactionId) {
+  if (txn.date < SYNC_START_DATE) return;
+
+  const transactionId = String(txn.transaction_id);
+  const existingRow = rowByTransactionId[transactionId];
+  const signature = [
+    normalizeReplacementDate(txn.date),
+    String(Number(txn.amount)),
+    String(txn.name || txn.merchant_name || "").trim().toLowerCase()
+  ].join("|");
+  const possibleDuplicates = duplicateIndex[signature] || [];
+  const values = [
+    "", "REVIEW", transactionId, txn.date, txn.amount,
+    txn.name || txn.merchant_name || "", txn.merchant_name || "",
+    txn.personal_finance_category?.primary || "",
+    txn.personal_finance_category?.detailed || "",
+    txn.account_id || "", possibleDuplicates.join(", ")
+  ];
+
+  if (existingRow) {
+    sheet.getRange(existingRow, 1, 1, values.length).setValues([values]);
+  } else {
+    const row = sheet.getLastRow() + 1;
+    sheet.getRange(row, 1, 1, values.length).setValues([values]);
+    rowByTransactionId[transactionId] = row;
+  }
+}
+
+function stagePendingPlaidItemTransactions() {
+  const itemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
+  if (!itemId) throw new Error("There is no newly linked Plaid Item waiting for replacement review.");
+
+  const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`);
+  if (!accessToken) throw new Error(`Cannot stage Plaid Item ${itemId}: its access token is missing.`);
+
+  const sheet = getPlaidReplacementReviewSheet(itemId);
+  const lastRow = sheet.getLastRow();
+  const rowByTransactionId = {};
+  if (lastRow >= PLAID_REPLACEMENT_DATA_START_ROW) {
+    sheet.getRange(PLAID_REPLACEMENT_DATA_START_ROW, 3, lastRow - PLAID_REPLACEMENT_DATA_START_ROW + 1, 1)
+      .getValues()
+      .forEach((row, index) => {
+        rowByTransactionId[String(row[0])] = PLAID_REPLACEMENT_DATA_START_ROW + index;
+      });
+  }
+  const duplicateIndex = getReplacementDuplicateIndex();
+  const sessionStartCursor = financeScriptProperties.getProperty(`PLAID_CURSOR_${itemId}`) || "";
+  let cursor = sessionStartCursor;
+  let hasMore = true;
+  const startTime = Date.now();
+  const TIME_BUDGET_MS = 5 * 60 * 1000;
+
+  sheet.getRange(3, 2).setValue("Staging in progress");
+  while (hasMore) {
+    if (Date.now() - startTime > TIME_BUDGET_MS) {
+      sheet.getRange(3, 2).setValue("More pages remain; run stagePendingPlaidItemTransactions() again to continue");
+      return { status: "in_progress", item_id: itemId };
+    }
+
+    const result = fetchNextSyncPage(accessToken, cursor);
+    if (!result.success) {
+      if (result.error === "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION") {
+        cursor = sessionStartCursor;
+        continue;
+      }
+      throw new Error(`Could not stage transactions for Plaid Item ${itemId}: ${result.error}`);
+    }
+
+    const syncData = result.data;
+    (syncData.added || []).forEach(txn =>
+      stagePlaidReplacementTransaction(sheet, txn, duplicateIndex, rowByTransactionId)
+    );
+    (syncData.modified || []).forEach(txn =>
+      stagePlaidReplacementTransaction(sheet, txn, duplicateIndex, rowByTransactionId)
+    );
+    (syncData.removed || []).forEach(removed => {
+      const row = rowByTransactionId[String(removed.transaction_id)];
+      if (row) sheet.getRange(row, 2).setValue("REMOVED");
+    });
+
+    cursor = syncData.next_cursor;
+    financeScriptProperties.setProperty(`PLAID_CURSOR_${itemId}`, cursor);
+    hasMore = syncData.has_more;
+  }
+
+  sheet.getRange(3, 2).setValue("Complete — review all rows before finalizing");
+  return { status: "complete", item_id: itemId, staged_transactions: Math.max(0, sheet.getLastRow() - PLAID_REPLACEMENT_DATA_START_ROW + 1) };
+}
+
+function finalizePlaidItemReplacement() {
+  const newItemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
+  if (!newItemId) throw new Error("There is no staged Plaid Item replacement to finalize.");
+
+  const sheet = getPlaidReplacementReviewSheet(newItemId);
+  if (String(sheet.getRange(3, 2).getValue()).indexOf("Complete") !== 0) {
+    throw new Error("The new Item's history is not fully staged. Run stagePendingPlaidItemTransactions() until it reports complete.");
+  }
+
+  const oldItemId = String(sheet.getRange(1, 2).getValue()).trim();
+  if (!oldItemId || oldItemId === newItemId) {
+    throw new Error("Enter the existing Item ID to replace in cell B1 of the Plaid Review sheet.");
+  }
+  const itemIds = JSON.parse(financeScriptProperties.getProperty("PLAID_ITEM_IDS") || "[]");
+  if (!itemIds.includes(oldItemId)) {
+    throw new Error(`The old Item ID "${oldItemId}" is not in the active linked Item list.`);
+  }
+  if (itemIds.includes(newItemId)) {
+    throw new Error(`The new Item ID "${newItemId}" is already active; refusing to replace an Item with itself.`);
+  }
+
+  const lastRow = sheet.getLastRow();
+  const count = Math.max(0, lastRow - PLAID_REPLACEMENT_DATA_START_ROW + 1);
+  const rows = count
+    ? sheet.getRange(PLAID_REPLACEMENT_DATA_START_ROW, 1, count, 11).getValues()
+    : [];
+  for (let i = 0; i < rows.length; i++) {
+    const decision = String(rows[i][0]).trim().toUpperCase();
+    const status = String(rows[i][1]).trim().toUpperCase();
+    if (status === "REMOVED" || status === "IMPORTED" || status === "SKIPPED") continue;
+    if (decision !== "IMPORT" && decision !== "SKIP") {
+      throw new Error(`Set Decision to IMPORT or SKIP for every staged transaction. First unresolved row: ${PLAID_REPLACEMENT_DATA_START_ROW + i}.`);
+    }
+  }
+
+  let hasChanges = false;
+  rows.forEach((row, index) => {
+    const status = String(row[1]).trim().toUpperCase();
+    if (status === "REMOVED" || status === "IMPORTED" || status === "SKIPPED") return;
+    const sheetRow = PLAID_REPLACEMENT_DATA_START_ROW + index;
+    if (String(row[0]).trim().toUpperCase() === "SKIP") {
+      sheet.getRange(sheetRow, 2).setValue("SKIPPED");
+      return;
+    }
+
+    const txn = {
+      transaction_id: String(row[2]),
+      date: row[3] instanceof Date ? normalizeReplacementDate(row[3]) : String(row[3]),
+      amount: Number(row[4]),
+      name: String(row[5] || ""),
+      merchant_name: String(row[6] || ""),
+      personal_finance_category: {
+        primary: String(row[7] || ""),
+        detailed: String(row[8] || "")
+      }
+    };
+    const outcome = applyTransaction(txn, false);
+    if (outcome.error) {
+      throw new Error(`Could not import staged transaction ${txn.transaction_id}: ${outcome.error}`);
+    }
+    if (outcome.changed) hasChanges = true;
+    sheet.getRange(sheetRow, 2).setValue("IMPORTED");
+  });
+
+  if (hasChanges) {
+    [LIFESTYLE_SHEET, MANDATORY_SHEET].forEach(sheetName => {
+      recomputeAnnualRollup(getFinanceSheet(sheetName), sheetName);
+    });
+  }
+
+  const updatedItemIds = itemIds.map(itemId => itemId === oldItemId ? newItemId : itemId);
+  financeScriptProperties.setProperty("PLAID_ITEM_IDS", JSON.stringify(updatedItemIds));
+  financeScriptProperties.deleteProperty(`PLAID_ACCESSS_TOKEN_${oldItemId}`);
+  financeScriptProperties.deleteProperty(`PLAID_CURSOR_${oldItemId}`);
+  financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
+  sheet.getRange(3, 2).setValue(`Replaced ${oldItemId} with ${newItemId}`);
+  return { status: "success", old_item_id: oldItemId, new_item_id: newItemId };
+}
+
+function cancelPlaidItemReplacement() {
+  const newItemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
+  if (!newItemId) throw new Error("There is no pending Plaid Item replacement to cancel.");
+
+  const sheet = getPlaidReplacementReviewSheet(newItemId);
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= PLAID_REPLACEMENT_DATA_START_ROW) {
+    const statuses = sheet.getRange(
+      PLAID_REPLACEMENT_DATA_START_ROW,
+      2,
+      lastRow - PLAID_REPLACEMENT_DATA_START_ROW + 1,
+      1
+    ).getValues();
+    if (statuses.some(row => String(row[0]).trim().toUpperCase() === "IMPORTED")) {
+      throw new Error("This replacement has imported transactions. Finalize it instead of cancelling, or reconcile the imported transactions first.");
+    }
+  }
+
+  financeScriptProperties.deleteProperty(`PLAID_ACCESSS_TOKEN_${newItemId}`);
+  financeScriptProperties.deleteProperty(`PLAID_CURSOR_${newItemId}`);
+  financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
+  financeScriptProperties.deleteProperty("PLAID_LINK_MODE");
+  sheet.getRange(3, 2).setValue("Cancelled; staged rows retained for reference");
+  return { status: "cancelled", item_id: newItemId };
 }
 
 // =========================================================================

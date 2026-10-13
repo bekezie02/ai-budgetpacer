@@ -8,6 +8,7 @@ const MY_EMAIL = Session.getEffectiveUser().getEmail();
 // =========================================================================
 function runStep1() {
   try {
+    financeScriptProperties.deleteProperty('PLAID_LINK_MODE');
     let user = financeScriptProperties.getProperty('PLAID_USER');
     if (!user) {
       user = Utilities.getUuid();
@@ -51,8 +52,32 @@ function runStep1() {
   }
 }
 
+function startPlaidItemReplacementLink() {
+  const itemIds = JSON.parse(financeScriptProperties.getProperty('PLAID_ITEM_IDS') || "[]");
+  if (itemIds.length === 0) {
+    throw new Error("Cannot start an Item replacement: no existing Plaid Items are linked.");
+  }
+  if (financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID')) {
+    throw new Error("A Plaid Item replacement is already waiting for review or finalization.");
+  }
+
+  const hostedLinkUrl = runStep1();
+  if (!hostedLinkUrl) {
+    throw new Error("Could not create the Plaid Link session. Check the Apps Script execution log for the Link token response.");
+  }
+  financeScriptProperties.setProperty('PLAID_LINK_MODE', 'REPLACEMENT_REVIEW');
+  return hostedLinkUrl;
+}
+
 function runStep2() {
   try {
+    if (
+      financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID') &&
+      financeScriptProperties.getProperty('PLAID_LINK_MODE') !== 'REPLACEMENT_REVIEW'
+    ) {
+      return { status: "error", message: "A Plaid Item replacement is still pending review. Finish or abandon that replacement before linking another Item." };
+    }
+
     const linkToken = CacheService.getScriptCache().get('CURRENT_LINK_TOKEN');
     if (!linkToken) return { status: "error", message: "Token expired out of cache memory." };
 
@@ -87,17 +112,32 @@ function runStep2() {
     const exchangeData = JSON.parse(exchangeResponse.getContentText());
 
     if (exchangeResponse.getResponseCode() === 200) {
-      let itemIds = financeScriptProperties.getProperty('PLAID_ITEM_IDS');
-      if (!itemIds) itemIds = "[]";
-      itemIds = JSON.parse(itemIds);
-      if (!itemIds.includes(exchangeData.item_id)) itemIds.push(exchangeData.item_id);
-      financeScriptProperties.setProperty('PLAID_ITEM_IDS', JSON.stringify(itemIds));
+      const itemIds = JSON.parse(financeScriptProperties.getProperty('PLAID_ITEM_IDS') || "[]");
+      const replacementReview = financeScriptProperties.getProperty('PLAID_LINK_MODE') === 'REPLACEMENT_REVIEW';
+      if (replacementReview && itemIds.includes(exchangeData.item_id)) {
+        return { status: "error", message: "The returned Plaid Item ID is already active; refusing to stage it as a replacement." };
+      }
+
       // FIXED: only set the access token for the item this exchange was
       // actually for — the old loop assigned this run's new token to every
       // item missing a stored token, which breaks as soon as more than one
       // item has ever been linked.
       financeScriptProperties.setProperty(`PLAID_ACCESSS_TOKEN_${exchangeData.item_id}`, exchangeData.access_token);
 
+      if (replacementReview) {
+        financeScriptProperties.setProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID', exchangeData.item_id);
+        financeScriptProperties.deleteProperty(`PLAID_CURSOR_${exchangeData.item_id}`);
+        financeScriptProperties.deleteProperty('PLAID_LINK_MODE');
+        const reviewSheet = getPlaidReplacementReviewSheet(exchangeData.item_id);
+        return {
+          status: "success",
+          item_id: exchangeData.item_id,
+          message: `New Item staged for review in "${reviewSheet.getName()}". Run stagePendingPlaidItemTransactions() to fetch its transactions.`
+        };
+      }
+
+      if (!itemIds.includes(exchangeData.item_id)) itemIds.push(exchangeData.item_id);
+      financeScriptProperties.setProperty('PLAID_ITEM_IDS', JSON.stringify(itemIds));
       return { status: "success" };
     } else {
       return { status: "error", message: `Plaid exchange failed: ${exchangeResponse.getContentText()}` };

@@ -83,3 +83,13 @@ Use `startFreshFinanceSheet(newSpreadsheetName)` — it repoints `FINANCE_SPREAD
 
 ### Re-syncing transactions from the beginning
 To replay transactions for the current spreadsheet, run `resyncTransactionsFromStart()` manually in the Apps Script editor. It clears only the linked Plaid items' saved sync cursors and immediately starts the normal paginated sync; it does not clear the Gmail reply-thread ID or spreadsheet data. Existing Ledger and Unknown entries are matched by Plaid transaction ID, so they are updated rather than duplicated. If the sync reaches its execution time limit, the saved cursors let subsequent regular syncs continue. The replay is still limited to the transaction history Plaid makes available for each linked account.
+
+### Replacing a Plaid Item with a new Link connection
+To test a new Link connection with the current-year history request without immediately syncing it into the budget:
+1. Run `startPlaidItemReplacementLink()` and open the returned Hosted Link URL.
+2. Complete Link, then run `runStep2()` to exchange the public token. The new Item is held out of normal syncing.
+3. Run `stagePendingPlaidItemTransactions()` until it reports `complete`. If it reports `in_progress`, run it again; the review sheet records staged pages and the cursor resumes where it stopped.
+4. In the generated `Plaid Review <item ID>` sheet, enter the old active Item ID in cell B1. For each transaction, set Decision in column A to `IMPORT` or `SKIP`. Review the suggested possible existing transaction IDs in column K against the displayed date, amount, and description; the suggestions are informational and do not decide automatically.
+5. After every transaction has a decision, run `finalizePlaidItemReplacement()`. It imports only `IMPORT` rows, replaces the old Item ID in this script's active list with the new Item, and removes the old token and cursor from Script Properties. Existing spreadsheet data and the Gmail reply-thread ID are retained.
+
+If you decide not to proceed, run `cancelPlaidItemReplacement()` before importing any staged rows. This removes the pending token from Script Properties and leaves the review sheet for reference. Neither finalizing nor cancelling removes an Item from Plaid itself. The requested history depends on the bank's availability. Do not finalize until the review is complete: matching and choosing `SKIP` for overlap is a manual review step because transaction IDs from separate Items are not guaranteed to match.
