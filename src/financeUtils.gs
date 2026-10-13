@@ -61,25 +61,43 @@ function startPlaidItemReplacementLink() {
     throw new Error("A Plaid Item replacement is already waiting for review or finalization.");
   }
 
+  financeScriptProperties.deleteProperty('PLAID_REPLACEMENT_LINK_LAST_ERROR');
   const hostedLinkUrl = runStep1();
   if (!hostedLinkUrl) {
     throw new Error("Could not create the Plaid Link session. Check the Apps Script execution log for the Link token response.");
   }
   financeScriptProperties.setProperty('PLAID_LINK_MODE', 'REPLACEMENT_REVIEW');
+  financeScriptProperties.setProperty('PLAID_REPLACEMENT_LINK_STARTED_AT', String(Date.now()));
   return hostedLinkUrl;
 }
 
 function runStep2() {
   try {
+    const replacementReview = financeScriptProperties.getProperty('PLAID_LINK_MODE') === 'REPLACEMENT_REVIEW';
     if (
       financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID') &&
-      financeScriptProperties.getProperty('PLAID_LINK_MODE') !== 'REPLACEMENT_REVIEW'
+      !replacementReview
     ) {
       return { status: "error", message: "A Plaid Item replacement is still pending review. Finish or abandon that replacement before linking another Item." };
     }
+    if (replacementReview) {
+      const startedAt = Number(financeScriptProperties.getProperty('PLAID_REPLACEMENT_LINK_STARTED_AT'));
+      if (!startedAt || Date.now() - startedAt > 25 * 60 * 1000) {
+        financeScriptProperties.deleteProperty('PLAID_LINK_MODE');
+        financeScriptProperties.deleteProperty('PLAID_REPLACEMENT_LINK_STARTED_AT');
+        return { status: "error", message: "The replacement Link session timed out. Send a new email with the subject Plaid Item Replacement to retry." };
+      }
+    }
 
     const linkToken = CacheService.getScriptCache().get('CURRENT_LINK_TOKEN');
-    if (!linkToken) return { status: "error", message: "Token expired out of cache memory." };
+    if (!linkToken) {
+      if (replacementReview) {
+        financeScriptProperties.deleteProperty('PLAID_LINK_MODE');
+        financeScriptProperties.deleteProperty('PLAID_REPLACEMENT_LINK_STARTED_AT');
+        return { status: "error", message: "The replacement Link token expired. Send a new email with the subject Plaid Item Replacement to retry." };
+      }
+      return { status: "error", message: "Token expired out of cache memory." };
+    }
 
     const getResponse = UrlFetchApp.fetch(`${plaidURL}/link/token/get`, {
       "method": "post",
@@ -90,11 +108,16 @@ function runStep2() {
 
     const getData = JSON.parse(getResponse.getContentText());
     if (getResponse.getResponseCode() !== 200) return { status: "error", message: getResponse.getContentText() };
-    if (!getData.link_sessions || getData.link_sessions.length === 0) return { status: "error", message: "No session array history." };
+    if (!getData.link_sessions || getData.link_sessions.length === 0) {
+      return replacementReview
+        ? { status: "pending" }
+        : { status: "error", message: "No session array history." };
+    }
 
     const latestSession = getData.link_sessions[0];
 
     if (!latestSession.results || !latestSession.results.item_add_results || latestSession.results.item_add_results.length === 0) {
+      if (replacementReview) return { status: "pending" };
       return { status: "error", message: "Login window closed or user did not finish bank authorization in time." };
     }
 
@@ -128,6 +151,7 @@ function runStep2() {
         financeScriptProperties.setProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID', exchangeData.item_id);
         financeScriptProperties.deleteProperty(`PLAID_CURSOR_${exchangeData.item_id}`);
         financeScriptProperties.deleteProperty('PLAID_LINK_MODE');
+        financeScriptProperties.deleteProperty('PLAID_REPLACEMENT_LINK_STARTED_AT');
         const reviewSheet = getPlaidReplacementReviewSheet(exchangeData.item_id);
         return {
           status: "success",

@@ -1236,6 +1236,8 @@ function finalizePlaidItemReplacement() {
   financeScriptProperties.deleteProperty(`PLAID_ACCESSS_TOKEN_${oldItemId}`);
   financeScriptProperties.deleteProperty(`PLAID_CURSOR_${oldItemId}`);
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
   sheet.getRange(3, 2).setValue(`Replaced ${oldItemId} with ${newItemId}`);
   return { status: "success", old_item_id: oldItemId, new_item_id: newItemId };
 }
@@ -1262,6 +1264,10 @@ function cancelPlaidItemReplacement() {
   financeScriptProperties.deleteProperty(`PLAID_CURSOR_${newItemId}`);
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_LINK_STARTED_AT");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_LINK_LAST_ERROR");
   financeScriptProperties.deleteProperty("PLAID_LINK_MODE");
   sheet.getRange(3, 2).setValue("Cancelled; staged rows retained for reference");
   return { status: "cancelled", item_id: newItemId };

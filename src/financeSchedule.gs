@@ -83,8 +83,6 @@ function checkInboxForTriggers() {
   // Look for unread emails from you with the subject "Plaid Link"
   const threads = GmailApp.search(`is:unread from:${MY_EMAIL} subject:"Plaid Link"`);
 
-  if (threads.length === 0) return; // Nothing to do
-
   for (const thread of threads) {
     // 1. Mark it read so it doesn't trigger again
     thread.markRead();
@@ -126,7 +124,127 @@ function checkInboxForTriggers() {
       });
     }
   }
+
+  // Replacement requests use a distinct subject so they cannot accidentally
+  // take the normal path that immediately activates every new Plaid Item.
+  const replacementThreads = GmailApp.search(
+    `is:unread from:${MY_EMAIL} subject:"Plaid Item Replacement"`
+  );
+
+  for (const thread of replacementThreads) {
+    thread.markRead();
+
+    try {
+      const hostedLinkUrl = startPlaidItemReplacementLink();
+      MailApp.sendEmail({
+        to: MY_EMAIL,
+        subject: "🔗 Action Required: Review New Plaid Item Connection",
+        htmlBody: `
+          <p>You requested a new Plaid Item for transaction-history replacement.</p>
+          <p><strong>Step 1:</strong> Complete the bank connection using the link below:</p>
+          <p><a href="${hostedLinkUrl}" style="background-color: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">Connect Bank</a></p>
+          <p>The script will check for completion automatically for up to 25 minutes. The new Item will be staged for review and will not replace the active Item automatically.</p>
+        `
+      });
+      Logger.log("Replacement Link emailed. The next inbox-trigger runs will check for completion.");
+    } catch (error) {
+      MailApp.sendEmail({
+        to: MY_EMAIL,
+        subject: "❌ Could Not Start Plaid Item Replacement",
+        htmlBody: `<p>The replacement request could not be started:</p><pre>${error.message || error}</pre>`
+      });
+    }
+  }
+
+  checkPendingPlaidReplacementLink();
+  checkPendingPlaidReplacementApproval();
 }
+
+function checkPendingPlaidReplacementLink() {
+  if (financeScriptProperties.getProperty('PLAID_LINK_MODE') !== 'REPLACEMENT_REVIEW') return;
+
+  const outcome = runStep2();
+  if (outcome.status === "pending") return;
+
+  if (outcome.status === "success") {
+    financeScriptProperties.deleteProperty('PLAID_REPLACEMENT_LINK_LAST_ERROR');
+    const itemId = financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID');
+    if (!itemId) throw new Error("Plaid reported replacement success, but the pending Item ID is missing.");
+    sendPlaidReplacementReviewEmail(itemId, outcome.message);
+    return;
+  }
+
+  if (!financeScriptProperties.getProperty('PLAID_REPLACEMENT_LINK_LAST_ERROR')) {
+    MailApp.sendEmail({
+      to: MY_EMAIL,
+      subject: "❌ Plaid Item Replacement Link Needs Attention",
+      htmlBody: `<p>The replacement Link check failed:</p><pre>${outcome.message}</pre><p>The script will keep checking until the Link session times out.</p>`
+    });
+    financeScriptProperties.setProperty('PLAID_REPLACEMENT_LINK_LAST_ERROR', outcome.message || "Unknown Link error");
+  }
+}
+
+function sendPlaidReplacementReviewEmail(itemId, linkMessage) {
+  const subject = `Plaid Replacement Review: ${itemId}`;
+  const reviewSheet = getPlaidReplacementReviewSheet(itemId);
+  const reviewUrl = `${getFinanceSpreadsheet().getUrl()}#gid=${reviewSheet.getSheetId()}`;
+  const body = `${linkMessage}\n\n` +
+    `Review the staged transactions here: ${reviewUrl}\n` +
+    `After staging is complete, enter the old active Item ID in cell B1. Set every transaction's Decision in column A to IMPORT or SKIP. ` +
+    `Then reply to this email with exactly:\nFINALIZE ${itemId}\n\n` +
+    `The replacement will not be finalized until every staged transaction has a decision.`;
+
+  GmailApp.sendEmail(MY_EMAIL, subject, body);
+  const sentThreads = GmailApp.search(
+    `in:sent to:${MY_EMAIL} subject:"${subject}" newer_than:1d`,
+    0,
+    10
+  );
+  const sentThread = sentThreads.find(thread => thread.getFirstMessageSubject() === subject);
+  if (!sentThread) {
+    throw new Error(`Sent the Plaid replacement review email, but could not locate its Gmail thread for approval tracking (${itemId}).`);
+  }
+
+  sentThread.markRead();
+  financeScriptProperties.setProperty('PLAID_REPLACEMENT_APPROVAL_THREAD_ID', sentThread.getId());
+  financeScriptProperties.setProperty('PLAID_REPLACEMENT_APPROVAL_ITEM_ID', itemId);
+}
+
+function checkPendingPlaidReplacementApproval() {
+  const threadId = financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_THREAD_ID');
+  const expectedItemId = financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_ITEM_ID');
+  const pendingItemId = financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID');
+  if (!threadId || !expectedItemId || expectedItemId !== pendingItemId) return;
+
+  const thread = GmailApp.getThreadById(threadId);
+  if (!thread) {
+    throw new Error(`Could not find the Plaid replacement approval thread for Item ${expectedItemId}.`);
+  }
+
+  const reply = thread.getMessages().find(message => {
+    if (!message.isUnread()) return false;
+    const from = message.getFrom();
+    const emailMatch = from.match(/<([^>]+)>/);
+    const senderEmail = (emailMatch ? emailMatch[1] : from).trim().toLowerCase();
+    return senderEmail === MY_EMAIL.toLowerCase();
+  });
+  if (!reply) return;
+
+  reply.markRead();
+  const replyText = extractNewReplyOnly(reply);
+  if (replyText !== `FINALIZE ${expectedItemId}`) {
+    thread.reply(`No action was taken. To approve this replacement after reviewing every transaction, reply with exactly:\nFINALIZE ${expectedItemId}`);
+    return;
+  }
+
+  try {
+    const result = finalizePlaidItemReplacement();
+    thread.reply(`Plaid Item replacement completed.\nOld Item: ${result.old_item_id}\nNew Item: ${result.new_item_id}`);
+  } catch (error) {
+    thread.reply(`The Plaid Item replacement was not finalized:\n${error.message || error}\n\nAfter addressing the issue, reply again with exactly:\nFINALIZE ${expectedItemId}`);
+  }
+}
+
 function extractNewReplyOnly(messageObject) {
   // 1. Use plain text body to immediately save ~80% of token weight
   let body = messageObject.getPlainBody();
