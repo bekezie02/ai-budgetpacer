@@ -234,8 +234,8 @@ function checkPendingPlaidReplacementApproval() {
   if (!reply) return;
 
   reply.markRead();
-  const replyText = extractNewReplyOnly(reply);
-  if (replyText === `CANCEL ${expectedItemId}`) {
+  const replyCommand = getPlaidReplacementReplyCommand(reply);
+  if (replyCommand.toUpperCase() === `CANCEL ${expectedItemId}`.toUpperCase()) {
     let result;
     try {
       result = cancelPlaidItemReplacement();
@@ -256,9 +256,9 @@ function checkPendingPlaidReplacementApproval() {
     return;
   }
 
-  if (replyText !== `FINALIZE ${expectedItemId}`) {
+  if (replyCommand.toUpperCase() !== `FINALIZE ${expectedItemId}`.toUpperCase()) {
     thread.reply(
-      `No action was taken. Reply with exactly one of these commands:\n` +
+      `No action was taken. Put exactly one of these commands on the first nonblank line of your reply:\n` +
       `FINALIZE ${expectedItemId}\n` +
       `CANCEL ${expectedItemId}`
     );
@@ -280,6 +280,12 @@ function checkPendingPlaidReplacementApproval() {
   } catch (error) {
     thread.reply(`The Plaid Item replacement was not finalized:\n${error.message || error}\n\nAfter addressing the issue, reply again with exactly:\nFINALIZE ${expectedItemId}`);
   }
+}
+
+function getPlaidReplacementReplyCommand(messageObject) {
+  const replyText = extractNewReplyOnly(messageObject);
+  const firstReplyLine = replyText.split(/\r?\n/).find(line => line.trim() && !line.trim().startsWith(">"));
+  return firstReplyLine ? firstReplyLine.trim() : "";
 }
 
 function extractNewReplyOnly(messageObject) {
