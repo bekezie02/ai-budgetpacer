@@ -267,7 +267,16 @@ function checkPendingPlaidReplacementApproval() {
 
   try {
     const result = finalizePlaidItemReplacement();
-    thread.reply(`Plaid Item replacement completed.\nOld Item: ${result.old_item_id}\nNew Item: ${result.new_item_id}`);
+    const sheetCleanup = result.review_sheet_deleted
+      ? "The replacement review sheet was deleted."
+      : `The replacement is complete, but its review sheet could not be deleted: ${result.review_sheet_delete_error}`;
+    thread.reply(
+      `Plaid Item replacement completed.\n` +
+      `Old Item: ${result.old_item_id}\n` +
+      `New Item: ${result.new_item_id}\n` +
+      `The new Item's access token and staged cursor are retained; the old Item's token and cursor were removed.\n` +
+      sheetCleanup
+    );
   } catch (error) {
     thread.reply(`The Plaid Item replacement was not finalized:\n${error.message || error}\n\nAfter addressing the issue, reply again with exactly:\nFINALIZE ${expectedItemId}`);
   }

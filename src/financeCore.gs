@@ -954,7 +954,7 @@ function runDailyFinanceSync() {
   const TIME_BUDGET_MS = 5 * 60 * 1000; // 5 minutes
 
   for (const itemId of itemIds) {
-    const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`);
+    const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESS_TOKEN_${itemId}`);
     if (!accessToken) continue;
 
     // Captured once, before this item's pagination begins — the recovery
@@ -1153,7 +1153,7 @@ function stagePendingPlaidItemTransactions() {
   const itemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   if (!itemId) throw new Error("There is no newly linked Plaid Item waiting for replacement review.");
 
-  const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`);
+  const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESS_TOKEN_${itemId}`);
   if (!accessToken) throw new Error(`Cannot stage Plaid Item ${itemId}: its access token is missing.`);
 
   const sheet = getPlaidReplacementReviewSheet(itemId);
@@ -1213,6 +1213,15 @@ function stagePendingPlaidItemTransactions() {
 function finalizePlaidItemReplacement() {
   const newItemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   if (!newItemId) throw new Error("There is no staged Plaid Item replacement to finalize.");
+
+  const newAccessToken = financeScriptProperties.getProperty(`PLAID_ACCESS_TOKEN_${newItemId}`);
+  if (!newAccessToken) {
+    throw new Error(`Cannot finalize Plaid Item ${newItemId}: its access token is missing.`);
+  }
+  const newCursor = financeScriptProperties.getProperty(`PLAID_CURSOR_${newItemId}`);
+  if (newCursor === null) {
+    throw new Error(`Cannot finalize Plaid Item ${newItemId}: its staged sync cursor is missing. Run stagePendingPlaidItemTransactions() again.`);
+  }
 
   const sheet = getPlaidReplacementReviewSheet(newItemId);
   if (String(sheet.getRange(3, 2).getValue()).indexOf("Complete") !== 0) {
@@ -1304,13 +1313,27 @@ function finalizePlaidItemReplacement() {
 
   const updatedItemIds = itemIds.map(itemId => itemId === oldItemId ? newItemId : itemId);
   financeScriptProperties.setProperty("PLAID_ITEM_IDS", JSON.stringify(updatedItemIds));
-  financeScriptProperties.deleteProperty(`PLAID_ACCESSS_TOKEN_${oldItemId}`);
+  financeScriptProperties.deleteProperty(`PLAID_ACCESS_TOKEN_${oldItemId}`);
   financeScriptProperties.deleteProperty(`PLAID_CURSOR_${oldItemId}`);
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
-  sheet.getRange(3, 2).setValue(`Replaced ${oldItemId} with ${newItemId}`);
-  return { status: "success", old_item_id: oldItemId, new_item_id: newItemId };
+  let reviewSheetDeleted = false;
+  let reviewSheetDeleteError = null;
+  try {
+    getFinanceSpreadsheet().deleteSheet(sheet);
+    reviewSheetDeleted = true;
+  } catch (error) {
+    reviewSheetDeleteError = error.message || String(error);
+    console.error(`Replacement completed, but review sheet "${sheet.getName()}" could not be deleted: ${reviewSheetDeleteError}`);
+  }
+  return {
+    status: "success",
+    old_item_id: oldItemId,
+    new_item_id: newItemId,
+    review_sheet_deleted: reviewSheetDeleted,
+    review_sheet_delete_error: reviewSheetDeleteError
+  };
 }
 
 function cancelPlaidItemReplacement() {
@@ -1349,7 +1372,7 @@ function cancelPlaidItemReplacement() {
   }
 
   if (newItemId) {
-    financeScriptProperties.deleteProperty(`PLAID_ACCESSS_TOKEN_${newItemId}`);
+    financeScriptProperties.deleteProperty(`PLAID_ACCESS_TOKEN_${newItemId}`);
     financeScriptProperties.deleteProperty(`PLAID_CURSOR_${newItemId}`);
   }
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
@@ -1379,7 +1402,7 @@ function resyncTransactionsFromStart() {
   }
 
   const missingTokens = itemIds.filter(itemId =>
-    !financeScriptProperties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`)
+    !financeScriptProperties.getProperty(`PLAID_ACCESS_TOKEN_${itemId}`)
   );
   if (missingTokens.length > 0) {
     throw new Error(`Cannot re-sync transactions: missing access token(s) for Plaid item(s): ${missingTokens.join(", ")}.`);

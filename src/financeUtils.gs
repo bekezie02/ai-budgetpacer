@@ -145,7 +145,7 @@ function runStep2() {
       // actually for — the old loop assigned this run's new token to every
       // item missing a stored token, which breaks as soon as more than one
       // item has ever been linked.
-      financeScriptProperties.setProperty(`PLAID_ACCESSS_TOKEN_${exchangeData.item_id}`, exchangeData.access_token);
+      financeScriptProperties.setProperty(`PLAID_ACCESS_TOKEN_${exchangeData.item_id}`, exchangeData.access_token);
 
       if (replacementReview) {
         financeScriptProperties.setProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID', exchangeData.item_id);
