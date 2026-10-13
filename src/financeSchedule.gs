@@ -190,9 +190,12 @@ function sendPlaidReplacementReviewEmail(itemId, linkMessage) {
   const reviewUrl = `${getFinanceSpreadsheet().getUrl()}#gid=${reviewSheet.getSheetId()}`;
   const body = `${linkMessage}\n\n` +
     `Review the staged transactions here: ${reviewUrl}\n` +
-    `After staging is complete, enter the old active Item ID in cell B1. Set every transaction's Decision in column A to IMPORT or SKIP. ` +
+    `After staging is complete, enter the old active Item ID in cell B1. Decision is pre-filled: a unique exact date, amount, and description match is REPLACE <old transaction ID>; all other transactions default to IMPORT. Change IMPORT to SKIP in column A for any transaction you do not want to import. ` +
+    `Status REVIEW flags rows with multiple possible matches in column K; check these carefully because their default IMPORT could create a duplicate. REPLACE removes the old Ledger/Unknown entry before applying the new Item's transaction ID. ` +
     `Then reply to this email with exactly:\nFINALIZE ${itemId}\n\n` +
-    `The replacement will not be finalized until every staged transaction has a decision.`;
+    `The replacement will not be finalized until every staged transaction has a valid decision.\n\n` +
+    `To cancel and start over, reply with exactly:\nCANCEL ${itemId}\n` +
+    `Cancellation deletes this replacement's review sheet and pending local Item credentials. It is refused if any transaction has already been imported or replaced, and it does not remove the Item from Plaid.`;
 
   GmailApp.sendEmail(MY_EMAIL, subject, body);
   const sentThreads = GmailApp.search(
@@ -232,8 +235,33 @@ function checkPendingPlaidReplacementApproval() {
 
   reply.markRead();
   const replyText = extractNewReplyOnly(reply);
+  if (replyText === `CANCEL ${expectedItemId}`) {
+    let result;
+    try {
+      result = cancelPlaidItemReplacement();
+    } catch (error) {
+      thread.reply(
+        `The Plaid Item replacement was not cancelled:\n${error.message || error}\n\n` +
+        `If no transactions have been imported or replaced, reply again with exactly:\nCANCEL ${expectedItemId}`
+      );
+      return;
+    }
+
+    thread.reply(
+      `Plaid Item replacement cancelled.\n` +
+      `Pending Item: ${expectedItemId}\n` +
+      `Review sheet deleted: ${result.review_sheet_deleted ? "yes" : "no"}\n` +
+      `The Item itself was not removed from Plaid.`
+    );
+    return;
+  }
+
   if (replyText !== `FINALIZE ${expectedItemId}`) {
-    thread.reply(`No action was taken. To approve this replacement after reviewing every transaction, reply with exactly:\nFINALIZE ${expectedItemId}`);
+    thread.reply(
+      `No action was taken. Reply with exactly one of these commands:\n` +
+      `FINALIZE ${expectedItemId}\n` +
+      `CANCEL ${expectedItemId}`
+    );
     return;
   }
 

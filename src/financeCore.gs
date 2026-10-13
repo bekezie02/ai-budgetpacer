@@ -1010,23 +1010,26 @@ function runDailyFinanceSync() {
   return { hasChanges, uncategorizedCount };
 }
 
+function getPlaidReplacementReviewSheetName(itemId) {
+  const safeItemId = String(itemId).replace(/[\[\]*\/\\?:]/g, "_").slice(0, 80);
+  return `${PLAID_REPLACEMENT_REVIEW_PREFIX}${safeItemId}`;
+}
+
 function getPlaidReplacementReviewSheet(itemId) {
   const ss = getFinanceSpreadsheet();
-  let sheetName = financeScriptProperties.getProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
-  if (!sheetName) {
-    const safeItemId = String(itemId).replace(/[\[\]*\/\\?:]/g, "_").slice(0, 80);
-    sheetName = `${PLAID_REPLACEMENT_REVIEW_PREFIX}${safeItemId}`;
-    financeScriptProperties.setProperty("PLAID_REPLACEMENT_REVIEW_SHEET", sheetName);
+  const sheetName = getPlaidReplacementReviewSheetName(itemId);
+  let sheet = ss.getSheetByName(sheetName);
+  if (sheet && String(sheet.getRange(2, 2).getValue()) !== String(itemId)) {
+    throw new Error(`Review sheet name collision for Plaid Item ${itemId}: "${sheetName}" belongs to another Item.`);
   }
 
-  let sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
     sheet = ss.insertSheet(sheetName);
     sheet.getRange(1, 1, 4, 2).setValues([
       ["Old Item ID to replace (fill before finalizing)", ""],
       ["New Item ID", itemId],
       ["Staging status", "Ready to stage transactions"],
-      ["Instructions", "Review each transaction against existing sheets; set Decision to IMPORT or SKIP before finalizing."]
+      ["Instructions", ""]
     ]);
     sheet.getRange(6, 1, 1, 11).setValues([[
       "Decision", "Status", "Transaction ID", "Date", "Amount", "Description",
@@ -1035,6 +1038,9 @@ function getPlaidReplacementReviewSheet(itemId) {
     ]]);
     sheet.setFrozenRows(6);
   }
+  sheet.getRange(4, 2).setValue(
+    "Unique exact date, amount, and description matches are set to REPLACE. All other transactions default to IMPORT; change Decision to SKIP for rows you do not want. REVIEW status flags multiple possible matches."
+  );
   return sheet;
 }
 
@@ -1053,7 +1059,7 @@ function getReplacementDuplicateIndex() {
       String(description || "").trim().toLowerCase()
     ].join("|");
     if (!index[signature]) index[signature] = [];
-    index[signature].push(String(txnId));
+    if (!index[signature].includes(String(txnId))) index[signature].push(String(txnId));
   };
 
   const ledger = getFinanceSheet(LEDGER_SHEET);
@@ -1083,8 +1089,12 @@ function stagePlaidReplacementTransaction(sheet, txn, duplicateIndex, rowByTrans
     String(txn.name || txn.merchant_name || "").trim().toLowerCase()
   ].join("|");
   const possibleDuplicates = duplicateIndex[signature] || [];
+  const automaticDecision = possibleDuplicates.length === 1
+    ? `REPLACE ${possibleDuplicates[0]}`
+    : "IMPORT";
   const values = [
-    "", "REVIEW", transactionId, txn.date, txn.amount,
+    automaticDecision, possibleDuplicates.length > 1 ? "REVIEW" : "AUTO_DECISION",
+    transactionId, txn.date, txn.amount,
     txn.name || txn.merchant_name || "", txn.merchant_name || "",
     txn.personal_finance_category?.primary || "",
     txn.personal_finance_category?.detailed || "",
@@ -1092,6 +1102,24 @@ function stagePlaidReplacementTransaction(sheet, txn, duplicateIndex, rowByTrans
   ];
 
   if (existingRow) {
+    const previous = sheet.getRange(existingRow, 1, 1, 2).getValues()[0];
+    const previousDecision = String(previous[0] || "").trim();
+    const previousStatus = String(previous[1] || "").trim().toUpperCase();
+    if (
+      previousDecision &&
+      (previousStatus === "REVIEW" || previousStatus === "AUTO_DECISION")
+    ) {
+      values[0] = previousDecision;
+      values[1] = previousStatus;
+    } else if (
+      previousStatus === "IMPORTED" ||
+      previousStatus === "REPLACED" ||
+      previousStatus === "SKIPPED" ||
+      previousStatus === "REMOVED"
+    ) {
+      values[0] = previousDecision;
+      values[1] = previousStatus;
+    }
     sheet.getRange(existingRow, 1, 1, values.length).setValues([values]);
   } else {
     const row = sheet.getLastRow() + 1;
@@ -1188,20 +1216,30 @@ function finalizePlaidItemReplacement() {
     ? sheet.getRange(PLAID_REPLACEMENT_DATA_START_ROW, 1, count, 11).getValues()
     : [];
   for (let i = 0; i < rows.length; i++) {
-    const decision = String(rows[i][0]).trim().toUpperCase();
+    const decision = String(rows[i][0]).trim();
+    const normalizedDecision = decision.toUpperCase();
     const status = String(rows[i][1]).trim().toUpperCase();
-    if (status === "REMOVED" || status === "IMPORTED" || status === "SKIPPED") continue;
-    if (decision !== "IMPORT" && decision !== "SKIP") {
-      throw new Error(`Set Decision to IMPORT or SKIP for every staged transaction. First unresolved row: ${PLAID_REPLACEMENT_DATA_START_ROW + i}.`);
+    if (status === "REMOVED" || status === "IMPORTED" || status === "REPLACED" || status === "SKIPPED") continue;
+
+    const replaceMatch = decision.match(/^REPLACE\s+(.+)$/i);
+    const suggestedIds = String(rows[i][10] || "").split(", ").filter(Boolean);
+    if (
+      normalizedDecision !== "IMPORT" &&
+      normalizedDecision !== "SKIP" &&
+      (!replaceMatch || !suggestedIds.includes(replaceMatch[1].trim()))
+    ) {
+      throw new Error(`Set Decision to IMPORT, SKIP, or REPLACE <suggested old transaction ID> for every staged transaction. First invalid or unresolved decision: ${PLAID_REPLACEMENT_DATA_START_ROW + i}.`);
     }
   }
 
   let hasChanges = false;
   rows.forEach((row, index) => {
     const status = String(row[1]).trim().toUpperCase();
-    if (status === "REMOVED" || status === "IMPORTED" || status === "SKIPPED") return;
+    if (status === "REMOVED" || status === "IMPORTED" || status === "REPLACED" || status === "SKIPPED") return;
     const sheetRow = PLAID_REPLACEMENT_DATA_START_ROW + index;
-    if (String(row[0]).trim().toUpperCase() === "SKIP") {
+    const decision = String(row[0]).trim();
+    const normalizedDecision = decision.toUpperCase();
+    if (normalizedDecision === "SKIP") {
       sheet.getRange(sheetRow, 2).setValue("SKIPPED");
       return;
     }
@@ -1217,12 +1255,22 @@ function finalizePlaidItemReplacement() {
         detailed: String(row[8] || "")
       }
     };
+    const replaceMatch = decision.match(/^REPLACE\s+(.+)$/i);
+    if (replaceMatch) {
+      const oldTransactionId = replaceMatch[1].trim();
+      const removal = applyTransaction({ transaction_id: oldTransactionId }, true);
+      if (removal.error) {
+        throw new Error(`Could not remove old transaction ${oldTransactionId} before replacing it with ${txn.transaction_id}: ${removal.error}`);
+      }
+      if (removal.changed) hasChanges = true;
+    }
+
     const outcome = applyTransaction(txn, false);
     if (outcome.error) {
       throw new Error(`Could not import staged transaction ${txn.transaction_id}: ${outcome.error}`);
     }
     if (outcome.changed) hasChanges = true;
-    sheet.getRange(sheetRow, 2).setValue("IMPORTED");
+    sheet.getRange(sheetRow, 2).setValue(replaceMatch ? "REPLACED" : "IMPORTED");
   });
 
   if (hasChanges) {
@@ -1244,33 +1292,56 @@ function finalizePlaidItemReplacement() {
 
 function cancelPlaidItemReplacement() {
   const newItemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
-  if (!newItemId) throw new Error("There is no pending Plaid Item replacement to cancel.");
+  const replacementLinkInProgress =
+    financeScriptProperties.getProperty("PLAID_LINK_MODE") === "REPLACEMENT_REVIEW";
+  if (!newItemId && !replacementLinkInProgress) {
+    throw new Error("There is no pending Plaid Item replacement or replacement Link session to cancel.");
+  }
 
-  const sheet = getPlaidReplacementReviewSheet(newItemId);
-  const lastRow = sheet.getLastRow();
-  if (lastRow >= PLAID_REPLACEMENT_DATA_START_ROW) {
-    const statuses = sheet.getRange(
-      PLAID_REPLACEMENT_DATA_START_ROW,
-      2,
-      lastRow - PLAID_REPLACEMENT_DATA_START_ROW + 1,
-      1
-    ).getValues();
-    if (statuses.some(row => String(row[0]).trim().toUpperCase() === "IMPORTED")) {
-      throw new Error("This replacement has imported transactions. Finalize it instead of cancelling, or reconcile the imported transactions first.");
+  let reviewSheet = null;
+  if (newItemId) {
+    const sheetName = getPlaidReplacementReviewSheetName(newItemId);
+    reviewSheet = getFinanceSpreadsheet().getSheetByName(sheetName);
+    if (reviewSheet) {
+      if (String(reviewSheet.getRange(2, 2).getValue()) !== String(newItemId)) {
+        throw new Error(`Refusing to delete "${sheetName}": it does not identify the pending Plaid Item ${newItemId}.`);
+      }
+
+      const lastRow = reviewSheet.getLastRow();
+      if (lastRow >= PLAID_REPLACEMENT_DATA_START_ROW) {
+        const statuses = reviewSheet.getRange(
+          PLAID_REPLACEMENT_DATA_START_ROW,
+          2,
+          lastRow - PLAID_REPLACEMENT_DATA_START_ROW + 1,
+          1
+        ).getValues();
+        if (statuses.some(row => {
+          const status = String(row[0]).trim().toUpperCase();
+          return status === "IMPORTED" || status === "REPLACED";
+        })) {
+          throw new Error("This replacement has imported transactions. The review sheet cannot be deleted; finalize the replacement or reconcile imported transactions first.");
+        }
+      }
     }
   }
 
-  financeScriptProperties.deleteProperty(`PLAID_ACCESSS_TOKEN_${newItemId}`);
-  financeScriptProperties.deleteProperty(`PLAID_CURSOR_${newItemId}`);
+  if (newItemId) {
+    financeScriptProperties.deleteProperty(`PLAID_ACCESSS_TOKEN_${newItemId}`);
+    financeScriptProperties.deleteProperty(`PLAID_CURSOR_${newItemId}`);
+  }
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
-  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_LINK_STARTED_AT");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_LINK_LAST_ERROR");
   financeScriptProperties.deleteProperty("PLAID_LINK_MODE");
-  sheet.getRange(3, 2).setValue("Cancelled; staged rows retained for reference");
-  return { status: "cancelled", item_id: newItemId };
+  CacheService.getScriptCache().remove("CURRENT_LINK_TOKEN");
+  if (reviewSheet) getFinanceSpreadsheet().deleteSheet(reviewSheet);
+  return {
+    status: "cancelled",
+    item_id: newItemId || null,
+    review_sheet_deleted: !!reviewSheet
+  };
 }
 
 // =========================================================================
