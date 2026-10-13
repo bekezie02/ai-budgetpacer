@@ -56,6 +56,20 @@ function getFinanceSheet(sheetName) {
   return sheet;
 }
 
+function ensureSheetHasRows(sheet, requiredLastRow) {
+  const maxRows = sheet.getMaxRows();
+  if (requiredLastRow > maxRows) {
+    sheet.insertRowsAfter(maxRows, Math.max(100, requiredLastRow - maxRows));
+  }
+}
+
+function appendSheetRow(sheet, values) {
+  const row = sheet.getLastRow() + 1;
+  ensureSheetHasRows(sheet, row);
+  sheet.getRange(row, 1, 1, values.length).setValues([values]);
+  return row;
+}
+
 // =========================================================================
 // CATEGORIZATION — driven entirely by the "Category Rules" sheet, since
 // only the account owner knows which merchant/Plaid category maps to which
@@ -181,7 +195,7 @@ function writeLedgerEntry(existingRow, txn, categorization, monthName, year) {
   if (existingRow) {
     sheet.getRange(existingRow, 1, 1, values.length).setValues([values]);
   } else {
-    sheet.appendRow(values);
+    appendSheetRow(sheet, values);
   }
 }
 
@@ -420,6 +434,8 @@ function createMonthSection(sheet, monthName, categories) {
   }
 
   const startRow = sheet.getLastRow() + 1;
+  const lastSectionRow = startRow + categories.length + 1;
+  ensureSheetHasRows(sheet, lastSectionRow);
   sheet.getRange(startRow, 1).setValue(monthName);
   sheet.getRange(startRow, 1).setFontWeight("bold");
 
@@ -461,6 +477,7 @@ function reconcileMonthSectionWithCategories(sheet, section, categories) {
       // insertRowBefore copies formatting from the adjacent row — since
       // we're inserting directly above the (bold) Total row, the new row
       // would otherwise inherit that bold formatting. Explicitly reset it.
+      ensureSheetHasRows(sheet, section.totalRow + 1);
       sheet.insertRowBefore(section.totalRow);
       sheet.getRange(section.totalRow, 1, 1, 4).setValues([[label, 0, monthlyBudget, monthlyBudget]]);
       sheet.getRange(section.totalRow, 1, 1, 4).setFontWeight("normal");
@@ -586,7 +603,7 @@ function adjustFixedPool(poolName, txn, delta) {
   } else if (existingRow) {
     sheet.getRange(existingRow, 1, 1, 3).setValues([[txn.date, txn.name || txn.merchant_name || "", txn.amount]]);
   } else {
-    sheet.appendRow([txn.date, txn.name || txn.merchant_name || "", txn.amount, txn.transaction_id]);
+    appendSheetRow(sheet, [txn.date, txn.name || txn.merchant_name || "", txn.amount, txn.transaction_id]);
   }
 
   const newLastRow = sheet.getLastRow();
@@ -649,7 +666,7 @@ function addOrUpdateUnknownTransaction(txn) {
   if (existingRow) {
     sheet.getRange(existingRow, 1, 1, values.length).setValues([values]);
   } else {
-    sheet.appendRow(values);
+    appendSheetRow(sheet, values);
   }
 }
 
@@ -774,7 +791,7 @@ function addCategoryRuleIfMissing(merchantName, pfcPrimary, pfcDetailed, targetS
     if (alreadyExists) return;
   }
 
-  sheet.appendRow([merchantName || "", pfcPrimary || "", pfcDetailed || "", targetSheet, targetField]);
+  appendSheetRow(sheet, [merchantName || "", pfcPrimary || "", pfcDetailed || "", targetSheet, targetField]);
 }
 
 /**
@@ -1144,6 +1161,7 @@ function stagePlaidReplacementTransaction(sheet, txn, duplicateIndex, rowByTrans
     sheet.getRange(existingRow, 1, 1, values.length).setValues([values]);
   } else {
     const row = sheet.getLastRow() + 1;
+    ensureSheetHasRows(sheet, row);
     sheet.getRange(row, 1, 1, values.length).setValues([values]);
     rowByTransactionId[transactionId] = row;
   }
