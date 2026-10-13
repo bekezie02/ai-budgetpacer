@@ -80,3 +80,6 @@ Pick one direction as source of truth to avoid silently overwriting changes:
 
 ### Starting a new year / fresh sheet
 Use `startFreshFinanceSheet(newSpreadsheetName)` — it repoints `FINANCE_SPREADSHEET_NAME` at the new sheet and clears sync cursors (bounded by `SYNC_START_DATE`) while keeping the same linked Plaid bank connections.
+
+### Re-syncing transactions from the beginning
+To replay transactions for the current spreadsheet, run `resyncTransactionsFromStart()` manually in the Apps Script editor. It clears only the linked Plaid items' saved sync cursors and immediately starts the normal paginated sync; it does not clear the Gmail reply-thread ID or spreadsheet data. Existing Ledger and Unknown entries are matched by Plaid transaction ID, so they are updated rather than duplicated. If the sync reaches its execution time limit, the saved cursors let subsequent regular syncs continue. The replay is still limited to the transaction history Plaid makes available for each linked account.

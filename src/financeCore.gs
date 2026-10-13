@@ -1009,6 +1009,32 @@ function runDailyFinanceSync() {
 }
 
 // =========================================================================
+// RE-SYNC FROM THE START — clears only Plaid cursors for the active linked
+// items, then replays their available history through the normal sync path.
+// The Gmail reply thread and existing spreadsheet data are left untouched.
+// =========================================================================
+function resyncTransactionsFromStart() {
+  const itemIds = JSON.parse(properties.getProperty('PLAID_ITEM_IDS') || "[]");
+  if (itemIds.length === 0) {
+    throw new Error("Cannot re-sync transactions: no linked Plaid items were found.");
+  }
+
+  const missingTokens = itemIds.filter(itemId =>
+    !properties.getProperty(`PLAID_ACCESSS_TOKEN_${itemId}`)
+  );
+  if (missingTokens.length > 0) {
+    throw new Error(`Cannot re-sync transactions: missing access token(s) for Plaid item(s): ${missingTokens.join(", ")}.`);
+  }
+
+  itemIds.forEach(itemId => {
+    properties.deleteProperty(`PLAID_CURSOR_${itemId}`);
+  });
+
+  console.log(`Plaid cursors cleared for ${itemIds.length} linked item(s). Starting sync from the beginning of each item's available history. Gmail reply thread and spreadsheet data were not cleared.`);
+  return runDailyFinanceSync();
+}
+
+// =========================================================================
 // SWITCH TO A NEW SPREADSHEET — points the automation at a different
 // Finances spreadsheet and clears each linked item's sync cursor so the
 // next runDailyFinanceSync() re-pulls full available transaction history
