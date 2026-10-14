@@ -20,6 +20,78 @@ function resetFinancialTriggers() {
   setFinancialTrigger();
 }
 
+function ensureTransactionLedgerEditTrigger(spreadsheet) {
+  const spreadsheetId = spreadsheet.getId();
+  const triggerExists = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === "handleTransactionLedgerEdit" &&
+    trigger.getTriggerSourceId() === spreadsheetId
+  );
+  if (!triggerExists) {
+    ScriptApp.newTrigger("handleTransactionLedgerEdit")
+      .forSpreadsheet(spreadsheet)
+      .onEdit()
+      .create();
+  }
+}
+
+function handleTransactionLedgerEdit(event) {
+  if (!event || !event.range || event.range.getSheet().getName() !== LEDGER_SHEET) return;
+  const range = event.range;
+  const firstColumn = range.getColumn();
+  const lastColumn = firstColumn + range.getNumColumns() - 1;
+  if (firstColumn > 9 || lastColumn < 9 || range.getLastRow() < 2) return;
+
+  const sheet = range.getSheet();
+  const firstRow = Math.max(2, range.getRow());
+  const lastRow = range.getLastRow();
+  const isSingleCellEdit = range.getNumRows() === 1 && range.getNumColumns() === 1;
+  const previousValue = isSingleCellEdit ? event.oldValue : undefined;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    for (let row = firstRow; row <= lastRow; row++) {
+      try {
+        restoreTransactionLedgerOverrideSelection(row, row === firstRow ? previousValue : undefined);
+      } catch (error) {
+        const detail = error && error.message ? error.message : String(error);
+        console.error(`Could not restore the override selection on ledger row ${row}: ${detail}`);
+      }
+    }
+    sheet.getParent().toast(
+      "A finance sync or replacement is running. The edit was not applied; please retry shortly.",
+      "Transaction category not changed",
+      6
+    );
+    return;
+  }
+
+  try {
+    for (let row = firstRow; row <= lastRow; row++) {
+      const selectedLabel = sheet.getRange(row, 9).getValue();
+      try {
+        processTransactionLedgerOverrideEdit(row, selectedLabel);
+      } catch (error) {
+        try {
+          restoreTransactionLedgerOverrideSelection(row, row === firstRow ? previousValue : undefined);
+        } catch (restoreError) {
+          const restoreDetail = restoreError && restoreError.message
+            ? restoreError.message
+            : String(restoreError);
+          console.error(`Could not restore the override selection on ledger row ${row}: ${restoreDetail}`);
+        }
+        const detail = error && error.message ? error.message : String(error);
+        console.error(`Could not apply the transaction override on ledger row ${row}: ${detail}`);
+        sheet.getParent().toast(
+          `Row ${row}: ${detail}`,
+          "Transaction category not changed",
+          8
+        );
+      }
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 // =========================================================================
 // Daily finance sync trigger — pulls transactions, updates the Monthly
 // LifeStyle/Mandatory sheets and fixed-pool ledgers, and only emails a
@@ -28,7 +100,10 @@ function resetFinancialTriggers() {
 // =========================================================================
 function setDailyFinanceTrigger() {
   ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === "dailyFinanceCheck") {
+    if (
+      trigger.getHandlerFunction() === "dailyFinanceCheck" ||
+      trigger.getHandlerFunction() === "continueDailyFinanceSync"
+    ) {
       ScriptApp.deleteTrigger(trigger);
     }
   });
@@ -38,15 +113,28 @@ function setDailyFinanceTrigger() {
     .everyDays(1)
     .atHour(7)
     .create();
+
+  ScriptApp.newTrigger("continueDailyFinanceSync")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
 }
 
 function resetDailyFinanceTrigger() {
   ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === "dailyFinanceCheck") {
+    if (
+      trigger.getHandlerFunction() === "dailyFinanceCheck" ||
+      trigger.getHandlerFunction() === "continueDailyFinanceSync"
+    ) {
       ScriptApp.deleteTrigger(trigger);
     }
   });
   setDailyFinanceTrigger();
+}
+
+function continueDailyFinanceSync() {
+  if (financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_ACTIVE") !== "true") return;
+  dailyFinanceCheck(true);
 }
 
 // =========================================================================
@@ -232,7 +320,7 @@ function sendPlaidReplacementReviewEmail(itemId, linkMessage) {
   const reviewUrl = `${getFinanceSpreadsheet().getUrl()}#gid=${reviewSheet.getSheetId()}`;
   const body = `${linkMessage || `Transaction staging is complete for Plaid Item ${itemId}.`}\n\n` +
     `Review the staged transactions here: ${reviewUrl}\n` +
-    `All available transactions for the current-year window have been staged. Enter the old active Item ID in cell B1. Decision is pre-filled: a unique exact date, amount, and description match is REPLACE <old transaction ID>; all other transactions default to IMPORT. Change IMPORT to SKIP in column A for any transaction you do not want to import. ` +
+    `All available transactions for the current-year window have been staged. Choose the old bank/Item to replace from the ordered dropdown in cell B1; each option shows its institution name and Item ID. Decision is pre-filled: a unique exact date, amount, and description match is REPLACE <old transaction ID>; all other transactions default to IMPORT. Change IMPORT to SKIP in column A for any transaction you do not want to import. ` +
     `Status REVIEW flags rows with multiple possible matches in column K; check these carefully because their default IMPORT could create a duplicate. REPLACE removes the old Ledger/Unknown entry before applying the new Item's transaction ID. ` +
     `Then reply to this email with exactly:\nFINALIZE ${itemId}\n\n` +
     `The replacement will not be finalized until every staged transaction has a valid decision.\n\n` +
@@ -273,7 +361,12 @@ function checkPendingPlaidReplacementApproval() {
     const senderEmail = (emailMatch ? emailMatch[1] : from).trim().toLowerCase();
     return senderEmail === MY_EMAIL.toLowerCase();
   });
-  if (!reply) return;
+  if (!reply) {
+    if (financeScriptProperties.getProperty('PLAID_REPLACEMENT_FINALIZATION_ITEM_ID') === expectedItemId) {
+      processPendingPlaidReplacementFinalization(thread, expectedItemId);
+    }
+    return;
+  }
 
   reply.markRead();
   const replyCommand = getPlaidReplacementReplyCommand(reply);
@@ -307,8 +400,25 @@ function checkPendingPlaidReplacementApproval() {
     return;
   }
 
+  financeScriptProperties.setProperty('PLAID_REPLACEMENT_FINALIZATION_ITEM_ID', expectedItemId);
+  processPendingPlaidReplacementFinalization(thread, expectedItemId);
+}
+
+function processPendingPlaidReplacementFinalization(thread, itemId) {
   try {
     const result = finalizePlaidItemReplacement();
+    if (result.status === "in_progress") {
+      if (financeScriptProperties.getProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID") !== itemId) {
+        thread.reply(
+          `Plaid Item replacement finalization is continuing in resumable batches.\n` +
+          `Item: ${itemId}\n` +
+          `No further reply is needed; the scheduled trigger will continue and email when complete.`
+        );
+        financeScriptProperties.setProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID", itemId);
+      }
+      return;
+    }
+
     const sheetCleanup = result.review_sheet_deleted
       ? "The replacement review sheet was deleted."
       : `The replacement is complete, but its review sheet could not be deleted: ${result.review_sheet_delete_error}`;
@@ -320,7 +430,9 @@ function checkPendingPlaidReplacementApproval() {
       sheetCleanup
     );
   } catch (error) {
-    thread.reply(`The Plaid Item replacement was not finalized:\n${error.message || error}\n\nAfter addressing the issue, reply again with exactly:\nFINALIZE ${expectedItemId}`);
+    financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_ITEM_ID");
+    financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID");
+    thread.reply(`The Plaid Item replacement was not finalized:\n${error.message || error}\n\nAfter addressing the issue, reply again with exactly:\nFINALIZE ${itemId}`);
   }
 }
 

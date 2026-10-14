@@ -424,18 +424,84 @@ function sendFinanceSummaryEmail() {
  * Entry point for the daily trigger: sync, and only email if the sync
  * actually changed something in the sheets.
  */
-function dailyFinanceCheck() {
-  ensureMonthSectionsUpToDate();
+function dailyFinanceCheck(isContinuation) {
+  if (!isContinuation) ensureMonthSectionsUpToDate();
   const syncResult = runDailyFinanceSync();
 
-  if (!syncResult.hasChanges) {
-    console.log("No finance changes today — skipping email.");
+  const backfillWasActive =
+    financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_ACTIVE") === "true";
+  const accumulatedChanges =
+    financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_HAS_CHANGES") === "true";
+  const accumulatedUnknownCount = Number(
+    financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_UNCATEGORIZED_COUNT") || 0
+  );
+
+  if (syncResult.errors.length > 0) {
+    const errorSummary = syncResult.errors.join("\n");
+    if (financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_LAST_ERROR") !== errorSummary) {
+      MailApp.sendEmail({
+        to: MY_EMAIL,
+        subject: "❌ Plaid transaction sync needs attention",
+        body:
+          `The sync has not caught up with all active Items:\n\n${errorSummary}\n\n` +
+          `The one-minute continuation trigger will retry automatically.`
+      });
+      financeScriptProperties.setProperty("DAILY_FINANCE_BACKFILL_LAST_ERROR", errorSummary);
+    }
+  } else {
+    financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_LAST_ERROR");
+  }
+
+  if (syncResult.needsContinuation) {
+    financeScriptProperties.setProperty("DAILY_FINANCE_BACKFILL_ACTIVE", "true");
+    financeScriptProperties.setProperty(
+      "DAILY_FINANCE_BACKFILL_HAS_CHANGES",
+      String(accumulatedChanges || syncResult.hasChanges)
+    );
+    financeScriptProperties.setProperty(
+      "DAILY_FINANCE_BACKFILL_UNCATEGORIZED_COUNT",
+      String(accumulatedUnknownCount + syncResult.uncategorizedCount)
+    );
+    console.log("Daily transaction sync is still catching up; the one-minute continuation trigger will resume from the saved cursors.");
     return;
   }
 
-  sendFinanceSummaryEmail();
+  const hasChanges = accumulatedChanges || syncResult.hasChanges;
+  const uncategorizedCount = accumulatedUnknownCount + syncResult.uncategorizedCount;
+  const completedBackfill = backfillWasActive || syncResult.startedFromBeginning;
 
-  if (syncResult.uncategorizedCount > 0) {
-    console.warn(`${syncResult.uncategorizedCount} transaction(s) were uncategorized this run — check the Category Rules sheet.`);
+  if (hasChanges) {
+    sendFinanceSummaryEmail();
+  } else {
+    console.log("No finance changes today — skipping summary email.");
   }
+
+  if (completedBackfill) {
+    sendDailySyncCompleteEmail();
+  }
+
+  if (uncategorizedCount > 0) {
+    console.warn(`${uncategorizedCount} transaction(s) were uncategorized during this sync — check the Category Rules sheet.`);
+  }
+
+  financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_ACTIVE");
+  financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_HAS_CHANGES");
+  financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_UNCATEGORIZED_COUNT");
+  financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_LAST_ERROR");
+}
+
+function sendDailySyncCompleteEmail() {
+  const completedAt = Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone(),
+    "yyyy-MM-dd HH:mm:ss z"
+  );
+  MailApp.sendEmail({
+    to: MY_EMAIL,
+    subject: "✅ Plaid transaction sync caught up",
+    body:
+      `The Plaid transaction sync has caught up with the latest available updates for all active Items.\n` +
+      `Completed: ${completedAt}\n` +
+      `Tracked transaction window starts ${SYNC_START_DATE}.`
+  });
 }

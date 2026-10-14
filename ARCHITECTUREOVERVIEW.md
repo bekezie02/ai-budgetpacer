@@ -20,6 +20,7 @@ For newcomers to the codebase. See [README.md](./README.md) for a high-level sum
 - **Fixed pool sheets** (one "Fixed - <label>" pool per fixed category + Travel) — each has an Annual Budget and a Remaining Balance.
 - **Uncategorized Transactions ("Unknown") sheet** — 8 columns (including merchant_name, pfc_primary, pfc_detailed) holding transactions that didn't match any Category Rule.
 - **Category Rules sheet** — Merchant Name Contains | Plaid Category (primary) Contains | Plaid Category (detailed) | Target Sheet | Target Field, AND-matched.
+- **Transaction Ledger** — source of truth for applied target and per-transaction category overrides. The Override Category dropdown can move an existing transaction to another monthly field, Fixed pool, or Ignore without changing its reusable Category Rule; choosing "Use original category" clears the override.
 
 ## How a day flows
 1. `dailyFinanceCheck()` fires (daily trigger).
@@ -37,6 +38,10 @@ For newcomers to the codebase. See [README.md](./README.md) for a high-level sum
 ## Performance/reliability notes for contributors
 - Rollup recompute (`recomputeAnnualRollup()`, a full-sheet scan) is intentionally run once per sync/reply, not per-transaction — running it per-transaction previously caused large backlog syncs to hit Apps Script's 6-minute execution limit before the cursor saved, stalling sync at the same point every run.
 - A 5-minute time-budget guard in `runDailyFinanceSync` checkpoints the cursor between pages as extra protection.
+- The daily sync trigger also installs a one-minute continuation trigger. Initial backfills resume from per-Item cursors until every active Item is caught up, then the script emails a completion notice (and a finance summary if data changed).
 - Plaid Item replacements use `startPlaidItemReplacementLink()`, automatic resumable staging through the one-minute inbox trigger (`stagePendingPlaidItemTransactions()` remains available for manual recovery), and `finalizePlaidItemReplacement()` so a new connection's transactions are reviewed before the active Item ID/token is swapped. Staging pre-fills `REPLACE <old transaction ID>` for a unique exact date/amount/description match and `IMPORT` otherwise. Multiple possible matches are flagged for review; `REPLACE` removes the existing Ledger/Unknown transaction before applying the new Item's ID, `IMPORT` intentionally keeps both, and `SKIP` ignores the staged row.
+- The replacement review sheet's old-Item dropdown follows `PLAID_ITEM_IDS` order and shows bank name plus Item ID; bank names are looked up from Plaid and cached in Script Properties.
+- Transaction Ledger edits to Override Category reclassify only that transaction, adjusting the previous and destination budgets and preserving the selected override through later Plaid updates. The adjacent default-target columns retain its original category so the override can be cleared; `setupFinanceSheets()` installs the required edit trigger and dropdown.
+- Replacement finalization is also time-bounded and resumable: each completed row is marked before the next batch, and the one-minute inbox trigger continues after the single `FINALIZE <item ID>` approval until it completes.
 - On successful finalization, `PLAID_ITEM_IDS` is switched to the new Item; its Item-keyed access token and staged sync cursor remain for normal sync, the old Item's token/cursor are removed, and the temporary review sheet is deleted.
 - Date handling: Sheets silently converts a written `"YYYY-MM-DD"` string into a real Date object, which can break re-deriving a transaction's month. `getMonthYearFromDate()` handles both string and Date input, with guards that return a clear error instead of crashing.

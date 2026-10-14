@@ -3,6 +3,65 @@ const plaidSecret = financeScriptProperties.getProperty('PLAID_SECRET')
 const plaidURL = financeScriptProperties.getProperty('PLAID_URL')
 const MY_EMAIL = Session.getEffectiveUser().getEmail();
 
+function getPlaidItemInstitutionName(itemId) {
+  const cacheKey = `PLAID_INSTITUTION_NAME_${itemId}`;
+  const cachedName = financeScriptProperties.getProperty(cacheKey);
+  if (cachedName) return cachedName;
+
+  const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESS_TOKEN_${itemId}`);
+  if (!accessToken) {
+    console.warn(`Cannot look up bank name for Plaid Item ${itemId}: access token is missing.`);
+    return "Bank name unavailable";
+  }
+
+  try {
+    const itemResponse = UrlFetchApp.fetch(`${plaidURL}/item/get`, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify({
+        client_id: plaidClientId,
+        secret: plaidSecret,
+        access_token: accessToken
+      }),
+      muteHttpExceptions: true
+    });
+    const itemData = JSON.parse(itemResponse.getContentText());
+    if (itemResponse.getResponseCode() !== 200) {
+      throw new Error(`Plaid /item/get returned HTTP ${itemResponse.getResponseCode()}.`);
+    }
+    if (itemData.item?.institution_name) {
+      financeScriptProperties.setProperty(cacheKey, itemData.item.institution_name);
+      return itemData.item.institution_name;
+    }
+    const institutionId = itemData.item?.institution_id;
+    if (!institutionId) throw new Error("Plaid returned no institution ID for this Item.");
+
+    const institutionResponse = UrlFetchApp.fetch(`${plaidURL}/institutions/get_by_id`, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify({
+        client_id: plaidClientId,
+        secret: plaidSecret,
+        institution_id: institutionId,
+        country_codes: ["US"]
+      }),
+      muteHttpExceptions: true
+    });
+    const institutionData = JSON.parse(institutionResponse.getContentText());
+    if (institutionResponse.getResponseCode() !== 200) {
+      throw new Error(`Plaid /institutions/get_by_id returned HTTP ${institutionResponse.getResponseCode()}.`);
+    }
+    const institutionName = institutionData.institution?.name;
+    if (!institutionName) throw new Error(`Plaid returned no name for institution ${institutionId}.`);
+
+    financeScriptProperties.setProperty(cacheKey, institutionName);
+    return institutionName;
+  } catch (error) {
+    console.warn(`Could not determine bank name for Plaid Item ${itemId}: ${error.message || error}`);
+    return "Bank name unavailable";
+  }
+}
+
 // =========================================================================
 // CORE PLAID OPERATIONS
 // =========================================================================

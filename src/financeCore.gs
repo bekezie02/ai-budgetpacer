@@ -6,6 +6,10 @@ const FINANCE_SPREADSHEET_NAME = financeScriptProperties.getProperty('FINANCE_SP
 const LIFESTYLE_SHEET = "Monthly LifeStyle Cost";
 const MANDATORY_SHEET = "Monthly Mandatory Cost";
 const LEDGER_SHEET = "Transaction Ledger";
+const LEDGER_OVERRIDE_COLUMN = 9;
+const LEDGER_DEFAULT_TARGET_SHEET_COLUMN = 10;
+const LEDGER_DEFAULT_TARGET_FIELD_COLUMN = 11;
+const CLEAR_TRANSACTION_OVERRIDE_LABEL = "Use original category";
 const RULES_SHEET = "Category Rules";
 const UNKNOWN_SHEET = "Uncategorized Transactions";
 const UNKNOWN_TARGET = "Unknown";
@@ -65,7 +69,12 @@ function ensureSheetHasRows(sheet, requiredLastRow) {
 
 function appendSheetRow(sheet, values) {
   const row = sheet.getLastRow() + 1;
+  const previousMaxRows = sheet.getMaxRows();
   ensureSheetHasRows(sheet, row);
+  if (sheet.getName() === LEDGER_SHEET && row > previousMaxRows) {
+    sheet.getRange(previousMaxRows + 1, LEDGER_OVERRIDE_COLUMN, sheet.getMaxRows() - previousMaxRows, 1)
+      .setDataValidation(getTransactionOverrideValidationRule());
+  }
   sheet.getRange(row, 1, 1, values.length).setValues([values]);
   return row;
 }
@@ -156,7 +165,8 @@ function getMonthYearFromDate(dateValue) {
 // applied and where," so a modified/removed transaction can be reversed
 // and reapplied correctly instead of just accumulating duplicate deltas.
 // Columns: Transaction ID | Date | Amount | Description | Target Sheet |
-//          Target Field | Month | Year
+//          Target Field | Month | Year | Override Category |
+//          Default Target Sheet | Default Target Field
 // =========================================================================
 function getLedgerRowByTxnId(txnId) {
   const sheet = getFinanceSheet(LEDGER_SHEET);
@@ -171,17 +181,32 @@ function getLedgerRowByTxnId(txnId) {
 
 function getLedgerRowValues(row) {
   const sheet = getFinanceSheet(LEDGER_SHEET);
-  const values = sheet.getRange(row, 1, 1, 8).getValues()[0];
+  const values = sheet.getRange(row, 1, 1, 11).getValues()[0];
   return {
     amount: values[2],
     targetSheet: values[4],
     targetField: values[5],
-    monthName: values[6]
+    monthName: values[6],
+    date: values[1],
+    transactionId: values[0],
+    description: values[3],
+    overrideCategory: String(values[8] || ""),
+    defaultTargetSheet: String(values[9] || ""),
+    defaultTargetField: String(values[10] || "")
   };
 }
 
-function writeLedgerEntry(existingRow, txn, categorization, monthName, year) {
+function writeLedgerEntry(existingRow, txn, categorization, monthName, year, options) {
   const sheet = getFinanceSheet(LEDGER_SHEET);
+  const existingOverride = existingRow
+    ? String(sheet.getRange(existingRow, LEDGER_OVERRIDE_COLUMN).getValue() || "")
+    : "";
+  const overrideCategory = options && Object.prototype.hasOwnProperty.call(options, "overrideCategory")
+    ? options.overrideCategory
+    : existingOverride;
+  const defaultCategorization = options && options.defaultCategorization
+    ? options.defaultCategorization
+    : categorization;
   const values = [
     txn.transaction_id,
     txn.date,
@@ -190,13 +215,49 @@ function writeLedgerEntry(existingRow, txn, categorization, monthName, year) {
     categorization.targetSheet,
     categorization.targetField,
     monthName,
-    year
+    year,
+    overrideCategory,
+    defaultCategorization ? defaultCategorization.targetSheet : "",
+    defaultCategorization ? defaultCategorization.targetField : ""
   ];
   if (existingRow) {
     sheet.getRange(existingRow, 1, 1, values.length).setValues([values]);
   } else {
     appendSheetRow(sheet, values);
   }
+}
+
+function getTransactionOverrideTargetLabel(target) {
+  const targetSheet = String(target.targetSheet || "").trim();
+  if (targetSheet === IGNORE_TARGET_SHEET) return IGNORE_TARGET_SHEET;
+
+  const fixedPoolName = getFixedPoolNameForTarget(targetSheet);
+  if (fixedPoolName) return `Fixed — ${fixedPoolName}`;
+  if (targetSheet === LIFESTYLE_SHEET) return `Lifestyle — ${target.targetField}`;
+  if (targetSheet === MANDATORY_SHEET) return `Mandatory — ${target.targetField}`;
+  throw new Error(`Unsupported transaction override target "${targetSheet}".`);
+}
+
+function getTransactionOverrideTargetMap() {
+  const targets = listValidCategoryTargets();
+  const targetMap = {};
+  targets.forEach(target => {
+    const label = getTransactionOverrideTargetLabel(target);
+    targetMap[label.toLowerCase()] = target;
+  });
+  return targetMap;
+}
+
+function getTransactionOverrideValidationRule() {
+  const targetMap = getTransactionOverrideTargetMap();
+  const labels = [
+    CLEAR_TRANSACTION_OVERRIDE_LABEL,
+    ...Object.keys(targetMap).map(key => getTransactionOverrideTargetLabel(targetMap[key]))
+  ];
+  return SpreadsheetApp.newDataValidation()
+    .requireValueInList([...new Set(labels)], true)
+    .setAllowInvalid(false)
+    .build();
 }
 
 function deleteLedgerRow(row) {
@@ -891,12 +952,7 @@ function applyTransaction(txn, isRemoval) {
 
   if (isRemoval) {
     if (prevInfo) {
-      const previousFixedPoolName = getFixedPoolNameForTarget(prevInfo.targetSheet);
-      if (previousFixedPoolName) {
-        adjustFixedPool(previousFixedPoolName, txn, null);
-      } else {
-        adjustFieldAmount(prevInfo.targetSheet, prevInfo.monthName, prevInfo.targetField, -Number(prevInfo.amount));
-      }
+      removeTransactionTargetEffect(txn, prevInfo);
       deleteLedgerRow(existingRow);
       return { changed: true };
     }
@@ -908,58 +964,279 @@ function applyTransaction(txn, isRemoval) {
     return { changed: false };
   }
 
-  // Modified/added: reverse the previous effect first if this transaction
-  // was already applied before (fixed pools handle their own overwrite by
-  // transaction ID, so no separate reversal is needed there).
-  if (prevInfo && !getFixedPoolNameForTarget(prevInfo.targetSheet)) {
-    adjustFieldAmount(prevInfo.targetSheet, prevInfo.monthName, prevInfo.targetField, -Number(prevInfo.amount));
-  }
-
   const rules = loadCategoryRules();
-  const categorization = categorizeTransaction(txn, rules);
+  const ruleCategorization = categorizeTransaction(txn, rules);
+  const defaultCategorization = ruleCategorization || (prevInfo && prevInfo.defaultTargetSheet
+    ? { targetSheet: prevInfo.defaultTargetSheet, targetField: prevInfo.defaultTargetField }
+    : null);
+  const overrideCategory = prevInfo ? prevInfo.overrideCategory : "";
+  const overrideTarget = overrideCategory
+    ? getTransactionOverrideTargetMap()[overrideCategory.toLowerCase()]
+    : null;
+  if (overrideCategory && !overrideTarget) {
+    return { changed: false, uncategorized: false, error: `Stored override "${overrideCategory}" is no longer a valid target for transaction ${txn.transaction_id}.` };
+  }
+  const categorization = overrideTarget || ruleCategorization;
+
   if (!categorization) {
+    if (prevInfo) removeTransactionTargetEffect(txn, prevInfo);
     if (existingRow) deleteLedgerRow(existingRow);
     addOrUpdateUnknownTransaction(txn); // dedupes by txn id itself
     return { changed: true, uncategorized: true };
   }
 
-  // It matched a rule now — don't leave a stale copy in Unknown if it was
-  // sitting there from a previous sync (e.g. a Category Rule was just added).
-  removeUnknownTransaction(txn.transaction_id);
-
-  if (String(categorization.targetSheet).trim().toLowerCase() === IGNORE_TARGET_SHEET.toLowerCase()) {
-    // Deliberately not tracked (e.g. a credit card payment — the spend was
-    // already counted when the original purchase posted). Any prior effect
-    // was already reversed above; just drop the stale ledger row, if any,
-    // and stop here — nothing gets written anywhere.
-    if (existingRow) deleteLedgerRow(existingRow);
-    return { changed: !!prevInfo }; // "changed" only if this reverses something that was previously tracked
+  const { monthName, year } = getMonthYearFromDate(txn.date);
+  if (!monthName) {
+    return { changed: false, uncategorized: false, error: `Could not determine month from transaction date "${txn.date}" for transaction ${txn.transaction_id}.` };
   }
 
-  const { monthName, year } = getMonthYearFromDate(txn.date);
-
-  const fixedPoolName = getFixedPoolNameForTarget(categorization.targetSheet);
-  if (fixedPoolName) {
-    adjustFixedPool(fixedPoolName, txn, txn.amount);
-  } else {
-    const result = adjustFieldAmount(categorization.targetSheet, monthName, categorization.targetField, txn.amount);
-    if (!result.success) {
-      console.warn("Could not apply transaction to sheet:", result.error);
-      return { changed: false, uncategorized: false, error: result.error };
+  if (String(categorization.targetSheet).trim().toLowerCase() !== IGNORE_TARGET_SHEET.toLowerCase()) {
+    try {
+      validateTransactionTarget(categorization, monthName);
+    } catch (error) {
+      const detail = error && error.message ? error.message : String(error);
+      return { changed: false, uncategorized: false, error: detail };
     }
   }
 
-  writeLedgerEntry(existingRow, txn, categorization, monthName, year);
+  if (prevInfo) removeTransactionTargetEffect(txn, prevInfo);
+
+  if (String(categorization.targetSheet).trim().toLowerCase() === IGNORE_TARGET_SHEET.toLowerCase()) {
+    if (overrideTarget) {
+      writeLedgerEntry(existingRow, txn, categorization, monthName, year, {
+        overrideCategory,
+        defaultCategorization
+      });
+      removeUnknownTransaction(txn.transaction_id);
+      return { changed: true };
+    }
+    if (existingRow) deleteLedgerRow(existingRow);
+    return { changed: !!prevInfo };
+  }
+
+  const result = addTransactionTargetEffect(txn, categorization, monthName);
+  if (!result.success) {
+    if (prevInfo) {
+      try {
+        addTransactionTargetEffect(txn, prevInfo, prevInfo.monthName);
+      } catch (rollbackError) {
+        const rollbackDetail = rollbackError && rollbackError.message
+          ? rollbackError.message
+          : String(rollbackError);
+        return {
+          changed: false,
+          uncategorized: false,
+          error: `${result.error} Rollback also failed: ${rollbackDetail}`
+        };
+      }
+    }
+    return { changed: false, uncategorized: false, error: result.error };
+  }
+
+  removeUnknownTransaction(txn.transaction_id);
+  writeLedgerEntry(existingRow, txn, categorization, monthName, year, {
+    overrideCategory,
+    defaultCategorization
+  });
   return { changed: true };
+}
+
+function removeTransactionTargetEffect(txn, previousTarget) {
+  const previousFixedPoolName = getFixedPoolNameForTarget(previousTarget.targetSheet);
+  if (previousFixedPoolName) {
+    adjustFixedPool(previousFixedPoolName, txn, null);
+  } else if (String(previousTarget.targetSheet).trim().toLowerCase() !== IGNORE_TARGET_SHEET.toLowerCase()) {
+    const result = adjustFieldAmount(
+      previousTarget.targetSheet,
+      previousTarget.monthName,
+      previousTarget.targetField,
+      -Number(previousTarget.amount)
+    );
+    if (!result.success) throw new Error(result.error);
+  }
+}
+
+function addTransactionTargetEffect(txn, target, monthName) {
+  const fixedPoolName = getFixedPoolNameForTarget(target.targetSheet);
+  if (fixedPoolName) {
+    adjustFixedPool(fixedPoolName, txn, txn.amount);
+    return { success: true };
+  }
+  if (String(target.targetSheet).trim().toLowerCase() === IGNORE_TARGET_SHEET.toLowerCase()) {
+    return { success: true };
+  }
+  return adjustFieldAmount(target.targetSheet, monthName, target.targetField, Number(txn.amount));
+}
+
+function getTransactionTargetKey(target) {
+  const fixedPoolName = getFixedPoolNameForTarget(target.targetSheet);
+  if (fixedPoolName) return `fixed:${fixedPoolName.toLowerCase()}`;
+  return `${String(target.targetSheet || "").trim().toLowerCase()}:${String(target.targetField || "").trim().toLowerCase()}`;
+}
+
+function validateTransactionTarget(target, monthName) {
+  const targetSheet = String(target.targetSheet || "").trim();
+  if (targetSheet.toLowerCase() === IGNORE_TARGET_SHEET.toLowerCase()) return;
+
+  const fixedPoolName = getFixedPoolNameForTarget(targetSheet);
+  if (fixedPoolName) {
+    getFinanceSheet(FIXED_POOL_PREFIX + fixedPoolName);
+    return;
+  }
+
+  if (targetSheet !== LIFESTYLE_SHEET && targetSheet !== MANDATORY_SHEET) {
+    throw new Error(`Unsupported target sheet "${targetSheet}".`);
+  }
+  const section = ensureMonthSection(targetSheet, monthName);
+  if (!section.success) throw new Error(section.error);
+  const sheet = getFinanceSheet(targetSheet);
+  const fieldRow = findRowByLabelInRange(
+    sheet,
+    target.targetField,
+    section.section.monthRow + 1,
+    section.section.totalRow - 1
+  );
+  if (!fieldRow) throw new Error(`Field "${target.targetField}" is not available in ${monthName} on ${targetSheet}.`);
+}
+
+function getTransactionOverrideChoiceForCurrentTarget(currentTarget, defaultTarget) {
+  if (defaultTarget && getTransactionTargetKey(currentTarget) === getTransactionTargetKey(defaultTarget)) {
+    return "";
+  }
+  return getTransactionOverrideTargetLabel(currentTarget);
+}
+
+function restoreTransactionLedgerOverrideSelection(row, previousValue) {
+  const sheet = getFinanceSheet(LEDGER_SHEET);
+  const values = sheet.getRange(row, 5, 1, 7).getValues()[0];
+  const inferredValue = getTransactionOverrideChoiceForCurrentTarget(
+    { targetSheet: String(values[0] || ""), targetField: String(values[1] || "") },
+    values[5]
+      ? { targetSheet: String(values[5]), targetField: String(values[6] || "") }
+      : null
+  );
+  sheet.getRange(row, LEDGER_OVERRIDE_COLUMN)
+    .setValue(previousValue === undefined ? inferredValue : previousValue);
+}
+
+function processTransactionLedgerOverrideEdit(row, selectedLabel) {
+  const sheet = getFinanceSheet(LEDGER_SHEET);
+  const rowValues = sheet.getRange(row, 1, 1, 11).getValues()[0];
+  const txn = {
+    transaction_id: rowValues[0],
+    date: rowValues[1],
+    amount: Number(rowValues[2]),
+    name: rowValues[3]
+  };
+  const previousTarget = {
+    targetSheet: String(rowValues[4] || ""),
+    targetField: String(rowValues[5] || ""),
+    monthName: String(rowValues[6] || ""),
+    amount: Number(rowValues[2])
+  };
+  const defaultTarget = rowValues[9]
+    ? { targetSheet: String(rowValues[9]), targetField: String(rowValues[10] || "") }
+    : previousTarget.targetSheet
+      ? { targetSheet: previousTarget.targetSheet, targetField: previousTarget.targetField }
+      : null;
+  if (!defaultTarget) {
+    throw new Error(`Transaction ${txn.transaction_id} has no stored target to use as its original category.`);
+  }
+  const label = String(selectedLabel || "").trim();
+  const clearingOverride = !label || label.toLowerCase() === CLEAR_TRANSACTION_OVERRIDE_LABEL.toLowerCase();
+  const destination = clearingOverride
+    ? defaultTarget
+    : getTransactionOverrideTargetMap()[label.toLowerCase()];
+  if (!destination) {
+    throw new Error(clearingOverride
+      ? "This transaction has no stored original category to restore."
+      : `"${label}" is not a valid override category. Choose a value from the dropdown.`);
+  }
+  const { monthName, year } = getMonthYearFromDate(txn.date);
+  if (!monthName || !Number.isFinite(year)) {
+    throw new Error(`Could not determine the month and year from transaction date "${txn.date}".`);
+  }
+  validateTransactionTarget(destination, monthName);
+  validateTransactionTarget(previousTarget, previousTarget.monthName || monthName);
+
+  const destinationCategory = clearingOverride ? "" : getTransactionOverrideTargetLabel(destination);
+  if (getTransactionTargetKey(previousTarget) !== getTransactionTargetKey(destination)) {
+    removeTransactionTargetEffect(txn, previousTarget);
+    let result;
+    try {
+      result = addTransactionTargetEffect(txn, destination, monthName);
+    } catch (error) {
+      try {
+        addTransactionTargetEffect(txn, previousTarget, previousTarget.monthName);
+      } catch (rollbackError) {
+        const rollbackDetail = rollbackError && rollbackError.message
+          ? rollbackError.message
+          : String(rollbackError);
+        const detail = error && error.message ? error.message : String(error);
+        throw new Error(`${detail} Rollback also failed: ${rollbackDetail}`);
+      }
+      throw error;
+    }
+    if (!result.success) {
+      try {
+        addTransactionTargetEffect(txn, previousTarget, previousTarget.monthName);
+      } catch (rollbackError) {
+        const rollbackDetail = rollbackError && rollbackError.message
+          ? rollbackError.message
+          : String(rollbackError);
+        throw new Error(`${result.error} Rollback also failed: ${rollbackDetail}`);
+      }
+      throw new Error(result.error);
+    }
+  }
+
+  sheet.getRange(row, 5, 1, 2).setValues([[destination.targetSheet, destination.targetField || ""]]);
+  sheet.getRange(row, LEDGER_OVERRIDE_COLUMN).setValue(destinationCategory);
+  sheet.getRange(row, LEDGER_DEFAULT_TARGET_SHEET_COLUMN, 1, 2).setValues([[
+    defaultTarget.targetSheet,
+    defaultTarget.targetField || ""
+  ]]);
+
+  const affectedMonthlySheets = new Set();
+  [previousTarget, destination].forEach(target => {
+    if (target.targetSheet === LIFESTYLE_SHEET || target.targetSheet === MANDATORY_SHEET) {
+      affectedMonthlySheets.add(target.targetSheet);
+    }
+  });
+  affectedMonthlySheets.forEach(sheetName => recomputeAnnualRollup(getFinanceSheet(sheetName), sheetName));
+  getFinanceSpreadsheet().toast(
+    clearingOverride
+      ? `Transaction restored to ${getTransactionOverrideTargetLabel(destination)}.`
+      : `Transaction moved to ${getTransactionOverrideTargetLabel(destination)}.`,
+    "Transaction category updated",
+    5
+  );
 }
 
 // =========================================================================
 // DAILY SYNC ORCHESTRATION
 // =========================================================================
 function runDailyFinanceSync() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    console.warn("runDailyFinanceSync: another sync or replacement operation is active; this run will be retried.");
+    return { hasChanges: false, uncategorizedCount: 0, needsContinuation: true, startedFromBeginning: false, errors: [] };
+  }
+
+  try {
+    return runDailyFinanceSyncLocked();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function runDailyFinanceSyncLocked() {
   const itemIds = JSON.parse(financeScriptProperties.getProperty('PLAID_ITEM_IDS') || "[]");
   let hasChanges = false;
   let uncategorizedCount = 0;
+  let needsContinuation = false;
+  let startedFromBeginning = false;
+  const errors = [];
 
   // Apps Script kills execution around 6 minutes. Leave real margin so a
   // page in progress always finishes (and its cursor gets saved) rather
@@ -972,7 +1249,13 @@ function runDailyFinanceSync() {
 
   for (const itemId of itemIds) {
     const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESS_TOKEN_${itemId}`);
-    if (!accessToken) continue;
+    if (!accessToken) {
+      const message = `Missing access token for active Plaid Item ${itemId}.`;
+      console.error(`runDailyFinanceSync: ${message}`);
+      errors.push(message);
+      needsContinuation = true;
+      continue;
+    }
 
     // Captured once, before this item's pagination begins — the recovery
     // target if Plaid reports TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION
@@ -981,13 +1264,16 @@ function runDailyFinanceSync() {
     // guidance is to restart pagination from wherever this session started,
     // not from "" (a full resync from the beginning of history) and not
     // from wherever it broke.
-    const sessionStartCursor = financeScriptProperties.getProperty(`PLAID_CURSOR_${itemId}`) || "";
+    const savedCursor = financeScriptProperties.getProperty(`PLAID_CURSOR_${itemId}`);
+    if (!savedCursor) startedFromBeginning = true;
+    const sessionStartCursor = savedCursor || "";
     let currentCursor = sessionStartCursor;
 
     let hasMore = true;
     while (hasMore) {
       if (Date.now() - startTime > TIME_BUDGET_MS) {
         console.warn(`runDailyFinanceSync: time budget reached — stopping at item ${itemId}, will resume from the saved cursor next run.`);
+        needsContinuation = true;
         break;
       }
 
@@ -999,28 +1285,40 @@ function runDailyFinanceSync() {
           continue;
         }
         console.log(`Failed fetching for item ${itemId}: ${result.error}`);
+        errors.push(`Plaid sync failed for Item ${itemId}: ${result.error}`);
+        needsContinuation = true;
         break;
       }
       const syncData = result.data;
 
-      (syncData.added || []).forEach(txn => {
-        if (txn.date < SYNC_START_DATE) return; // outside the tracked window — skip entirely
-        const outcome = applyTransaction(txn, false);
-        if (outcome.changed) hasChanges = true;
-        if (outcome.uncategorized) uncategorizedCount++;
-      });
-      (syncData.modified || []).forEach(txn => {
-        if (txn.date < SYNC_START_DATE) return;
-        const outcome = applyTransaction(txn, false);
-        if (outcome.changed) hasChanges = true;
-        if (outcome.uncategorized) uncategorizedCount++;
-      });
-      (syncData.removed || []).forEach(removedTxn => {
-        // Always attempt removal regardless of date — harmless no-op if it
-        // was never applied (e.g. it was outside the window to begin with).
-        const outcome = applyTransaction({ transaction_id: removedTxn.transaction_id }, true);
-        if (outcome.changed) hasChanges = true;
-      });
+      try {
+        for (const txn of syncData.added || []) {
+          if (txn.date < SYNC_START_DATE) continue;
+          const outcome = applyTransaction(txn, false);
+          if (outcome.error) throw new Error(outcome.error);
+          if (outcome.changed) hasChanges = true;
+          if (outcome.uncategorized) uncategorizedCount++;
+        }
+        for (const txn of syncData.modified || []) {
+          if (txn.date < SYNC_START_DATE) continue;
+          const outcome = applyTransaction(txn, false);
+          if (outcome.error) throw new Error(outcome.error);
+          if (outcome.changed) hasChanges = true;
+          if (outcome.uncategorized) uncategorizedCount++;
+        }
+        for (const removedTxn of syncData.removed || []) {
+          const outcome = applyTransaction({ transaction_id: removedTxn.transaction_id }, true);
+          if (outcome.error) throw new Error(outcome.error);
+          if (outcome.changed) hasChanges = true;
+        }
+      } catch (error) {
+        const detail = error && error.message ? error.message : String(error);
+        const message = `Could not apply transactions for Plaid Item ${itemId}: ${detail}`;
+        console.error(message);
+        errors.push(message);
+        needsContinuation = true;
+        break;
+      }
 
       // Advance BOTH the local cursor (so the next iteration of this same
       // execution actually moves forward) and the saved property (so the
@@ -1034,7 +1332,11 @@ function runDailyFinanceSync() {
       hasMore = syncData.has_more;
     }
 
-    if (Date.now() - startTime > TIME_BUDGET_MS) break; // don't start a new item once time's up
+    if (hasMore) needsContinuation = true;
+    if (Date.now() - startTime > TIME_BUDGET_MS) {
+      needsContinuation = true;
+      break;
+    }
   }
 
   // Recomputed once here instead of once per transaction inside
@@ -1045,7 +1347,7 @@ function runDailyFinanceSync() {
     });
   }
 
-  return { hasChanges, uncategorizedCount };
+  return { hasChanges, uncategorizedCount, needsContinuation, startedFromBeginning, errors };
 }
 
 function getPlaidReplacementReviewSheetName(itemId) {
@@ -1064,7 +1366,7 @@ function getPlaidReplacementReviewSheet(itemId) {
   if (!sheet) {
     sheet = ss.insertSheet(sheetName);
     sheet.getRange(1, 1, 4, 2).setValues([
-      ["Old Item ID to replace (fill before finalizing)", ""],
+      ["Old Item to replace (select bank / Item ID)", ""],
       ["New Item ID", itemId],
       ["Staging status", "Ready to stage transactions"],
       ["Instructions", ""]
@@ -1076,10 +1378,34 @@ function getPlaidReplacementReviewSheet(itemId) {
     ]]);
     sheet.setFrozenRows(6);
   }
+  const oldItemIds = JSON.parse(financeScriptProperties.getProperty("PLAID_ITEM_IDS") || "[]");
+  const oldItemOptions = oldItemIds.map(oldItemId => {
+    const bankName = getPlaidItemInstitutionName(oldItemId);
+    return `${bankName} — ${oldItemId}`;
+  });
+  if (oldItemOptions.length > 0) {
+    const selectedValue = String(sheet.getRange(1, 2).getValue()).trim();
+    const selectedItemId = getPlaidReplacementSelectedItemId(selectedValue);
+    const matchingOption = oldItemOptions.find(option =>
+      getPlaidReplacementSelectedItemId(option) === selectedItemId
+    );
+    sheet.getRange(1, 2)
+      .setDataValidation(SpreadsheetApp.newDataValidation()
+        .requireValueInList(oldItemOptions, true)
+        .setAllowInvalid(false)
+        .build());
+    if (matchingOption) sheet.getRange(1, 2).setValue(matchingOption);
+  }
   sheet.getRange(4, 2).setValue(
-    "Unique exact date, amount, and description matches are set to REPLACE. All other transactions default to IMPORT; change Decision to SKIP for rows you do not want. REVIEW status flags multiple possible matches."
+    "Select the old bank/Item to replace in B1. Unique exact date, amount, and description matches are set to REPLACE. All other transactions default to IMPORT; change Decision to SKIP for rows you do not want. REVIEW status flags multiple possible matches."
   );
   return sheet;
+}
+
+function getPlaidReplacementSelectedItemId(selection) {
+  const value = String(selection || "").trim();
+  const delimiterIndex = value.lastIndexOf(" — ");
+  return delimiterIndex >= 0 ? value.slice(delimiterIndex + 3).trim() : value;
 }
 
 function normalizeReplacementDate(dateValue) {
@@ -1245,9 +1571,33 @@ function stagePendingPlaidItemTransactionsLocked() {
 }
 
 function finalizePlaidItemReplacement() {
+  const itemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
+  if (!itemId) throw new Error("There is no staged Plaid Item replacement to finalize.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    financeScriptProperties.setProperty("PLAID_REPLACEMENT_FINALIZATION_ITEM_ID", itemId);
+    return { status: "in_progress", item_id: itemId };
+  }
+
+  try {
+    return finalizePlaidItemReplacementLocked();
+  } catch (error) {
+    financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_ITEM_ID");
+    financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID");
+    throw error;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function finalizePlaidItemReplacementLocked() {
   const newItemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   if (!newItemId) throw new Error("There is no staged Plaid Item replacement to finalize.");
 
+  const startTime = Date.now();
+  const TIME_BUDGET_MS = 4 * 60 * 1000;
+  financeScriptProperties.setProperty("PLAID_REPLACEMENT_FINALIZATION_ITEM_ID", newItemId);
   const newAccessToken = financeScriptProperties.getProperty(`PLAID_ACCESS_TOKEN_${newItemId}`);
   if (!newAccessToken) {
     throw new Error(`Cannot finalize Plaid Item ${newItemId}: its access token is missing.`);
@@ -1258,13 +1608,17 @@ function finalizePlaidItemReplacement() {
   }
 
   const sheet = getPlaidReplacementReviewSheet(newItemId);
-  if (String(sheet.getRange(3, 2).getValue()).indexOf("Complete") !== 0) {
+  const stagingStatus = String(sheet.getRange(3, 2).getValue());
+  if (
+    stagingStatus.indexOf("Complete") !== 0 &&
+    stagingStatus.indexOf("Finalization in progress") !== 0
+  ) {
     throw new Error("The new Item's history is not fully staged. Run stagePendingPlaidItemTransactions() until it reports complete.");
   }
 
-  const oldItemId = String(sheet.getRange(1, 2).getValue()).trim();
+  const oldItemId = getPlaidReplacementSelectedItemId(sheet.getRange(1, 2).getValue());
   if (!oldItemId || oldItemId === newItemId) {
-    throw new Error("Enter the existing Item ID to replace in cell B1 of the Plaid Review sheet.");
+    throw new Error("Select the existing bank/Item to replace from the dropdown in cell B1 of the Plaid Review sheet.");
   }
   const itemIds = JSON.parse(financeScriptProperties.getProperty("PLAID_ITEM_IDS") || "[]");
   if (!itemIds.includes(oldItemId)) {
@@ -1299,15 +1653,23 @@ function finalizePlaidItemReplacement() {
   syncFixedPoolsFromAnnualOverview();
 
   let hasChanges = false;
-  rows.forEach((row, index) => {
+  let processedRows = 0;
+  for (let index = 0; index < rows.length; index++) {
+    if (Date.now() - startTime >= TIME_BUDGET_MS) {
+      sheet.getRange(3, 2).setValue(`Finalization in progress; ${processedRows} rows processed this run, automatic continuation is scheduled`);
+      return { status: "in_progress", item_id: newItemId, processed_rows: processedRows };
+    }
+
+    const row = rows[index];
     const status = String(row[1]).trim().toUpperCase();
-    if (status === "REMOVED" || status === "IMPORTED" || status === "REPLACED" || status === "SKIPPED") return;
+    if (status === "REMOVED" || status === "IMPORTED" || status === "REPLACED" || status === "SKIPPED") continue;
     const sheetRow = PLAID_REPLACEMENT_DATA_START_ROW + index;
     const decision = String(row[0]).trim();
     const normalizedDecision = decision.toUpperCase();
     if (normalizedDecision === "SKIP") {
       sheet.getRange(sheetRow, 2).setValue("SKIPPED");
-      return;
+      processedRows++;
+      continue;
     }
 
     const txn = {
@@ -1337,9 +1699,14 @@ function finalizePlaidItemReplacement() {
     }
     if (outcome.changed) hasChanges = true;
     sheet.getRange(sheetRow, 2).setValue(replaceMatch ? "REPLACED" : "IMPORTED");
-  });
+    processedRows++;
+  }
 
-  if (hasChanges) {
+  const hasPreviouslyAppliedTransactions = rows.some(row => {
+    const status = String(row[1]).trim().toUpperCase();
+    return status === "IMPORTED" || status === "REPLACED";
+  });
+  if (hasChanges || hasPreviouslyAppliedTransactions) {
     [LIFESTYLE_SHEET, MANDATORY_SHEET].forEach(sheetName => {
       recomputeAnnualRollup(getFinanceSheet(sheetName), sheetName);
     });
@@ -1349,12 +1716,15 @@ function finalizePlaidItemReplacement() {
   financeScriptProperties.setProperty("PLAID_ITEM_IDS", JSON.stringify(updatedItemIds));
   financeScriptProperties.deleteProperty(`PLAID_ACCESS_TOKEN_${oldItemId}`);
   financeScriptProperties.deleteProperty(`PLAID_CURSOR_${oldItemId}`);
+  financeScriptProperties.deleteProperty(`PLAID_INSTITUTION_NAME_${oldItemId}`);
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_LAST_ERROR");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID");
   let reviewSheetDeleted = false;
   let reviewSheetDeleteError = null;
   try {
@@ -1374,6 +1744,19 @@ function finalizePlaidItemReplacement() {
 }
 
 function cancelPlaidItemReplacement() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    throw new Error("Another replacement staging or finalization run is active. Wait for it to finish, then retry cancellation.");
+  }
+
+  try {
+    return cancelPlaidItemReplacementLocked();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function cancelPlaidItemReplacementLocked() {
   const newItemId = financeScriptProperties.getProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   const replacementLinkInProgress =
     financeScriptProperties.getProperty("PLAID_LINK_MODE") === "REPLACEMENT_REVIEW";
@@ -1411,6 +1794,7 @@ function cancelPlaidItemReplacement() {
   if (newItemId) {
     financeScriptProperties.deleteProperty(`PLAID_ACCESS_TOKEN_${newItemId}`);
     financeScriptProperties.deleteProperty(`PLAID_CURSOR_${newItemId}`);
+    financeScriptProperties.deleteProperty(`PLAID_INSTITUTION_NAME_${newItemId}`);
   }
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
@@ -1420,6 +1804,8 @@ function cancelPlaidItemReplacement() {
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_LAST_ERROR");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_LINK_MODE");
   CacheService.getScriptCache().remove("CURRENT_LINK_TOKEN");
   if (reviewSheet) getFinanceSpreadsheet().deleteSheet(reviewSheet);
@@ -1503,11 +1889,28 @@ function setupFinanceSheets() {
 
   if (!ss.getSheetByName(LEDGER_SHEET)) {
     const sheet = ss.insertSheet(LEDGER_SHEET);
-    sheet.getRange(1, 1, 1, 8).setValues([[
+    sheet.getRange(1, 1, 1, 11).setValues([[
       "Transaction ID", "Date", "Amount", "Description",
-      "Target Sheet", "Target Field", "Month", "Year"
+      "Target Sheet", "Target Field", "Month", "Year",
+      "Override Category", "Default Target Sheet", "Default Target Field"
     ]]);
   }
+  const ledgerSheet = ss.getSheetByName(LEDGER_SHEET);
+  if (ledgerSheet.getMaxColumns() < 11) {
+    ledgerSheet.insertColumnsAfter(ledgerSheet.getMaxColumns(), 11 - ledgerSheet.getMaxColumns());
+  }
+  ledgerSheet.getRange(1, 9, 1, 3).setValues([[
+    "Override Category", "Default Target Sheet", "Default Target Field"
+  ]]);
+  if (
+    ledgerSheet.getMaxRows() > 1 &&
+    ss.getSheetByName(LIFESTYLE_SHEET) &&
+    ss.getSheetByName(MANDATORY_SHEET)
+  ) {
+    ledgerSheet.getRange(2, LEDGER_OVERRIDE_COLUMN, ledgerSheet.getMaxRows() - 1, 1)
+      .setDataValidation(getTransactionOverrideValidationRule());
+  }
+  ensureTransactionLedgerEditTrigger(ss);
 
   if (!ss.getSheetByName(UNKNOWN_SHEET)) {
     const sheet = ss.insertSheet(UNKNOWN_SHEET);
@@ -1521,5 +1924,5 @@ function setupFinanceSheets() {
   // creates each one automatically, sourcing its Annual Budget straight
   // from Annual Overview, the first time ensureMonthSectionsUpToDate() runs.
 
-  console.log("Finance sheet setup complete. Fill in Category Rules and Annual Overview — Fixed pools are created automatically from it.");
+  console.log("Finance sheet setup complete. Transaction Ledger category overrides are ready; fill in Category Rules and Annual Overview — Fixed pools are created automatically from it.");
 }
