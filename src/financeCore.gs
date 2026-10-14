@@ -9,6 +9,7 @@ const LEDGER_SHEET = "Transaction Ledger";
 const LEDGER_OVERRIDE_COLUMN = 9;
 const LEDGER_DEFAULT_TARGET_SHEET_COLUMN = 10;
 const LEDGER_DEFAULT_TARGET_FIELD_COLUMN = 11;
+const UNKNOWN_CATEGORY_COLUMN = 9;
 const CLEAR_TRANSACTION_OVERRIDE_LABEL = "Use original category";
 const RULES_SHEET = "Category Rules";
 const UNKNOWN_SHEET = "Uncategorized Transactions";
@@ -18,6 +19,7 @@ const FIXED_POOL_LEDGER_START_ROW = 5;
 const PLAID_REPLACEMENT_REVIEW_PREFIX = "Plaid Review ";
 const PLAID_REPLACEMENT_DATA_START_ROW = 7;
 let financeSpreadsheetCache = null;
+let unknownCategoryValidationRuleCache = null;
 
 // Only transactions on/after this date get applied to the sheets — added,
 // modified, AND removed transactions dated earlier are ignored entirely.
@@ -74,6 +76,9 @@ function appendSheetRow(sheet, values) {
   if (sheet.getName() === LEDGER_SHEET && row > previousMaxRows) {
     sheet.getRange(previousMaxRows + 1, LEDGER_OVERRIDE_COLUMN, sheet.getMaxRows() - previousMaxRows, 1)
       .setDataValidation(getTransactionOverrideValidationRule());
+  }
+  if (sheet.getName() === UNKNOWN_SHEET) {
+    setUnknownCategoryValidation(sheet, row, 1);
   }
   sheet.getRange(row, 1, 1, values.length).setValues([values]);
   return row;
@@ -258,6 +263,25 @@ function getTransactionOverrideValidationRule() {
     .requireValueInList([...new Set(labels)], true)
     .setAllowInvalid(false)
     .build();
+}
+
+function getUnknownCategoryValidationRule() {
+  if (unknownCategoryValidationRuleCache) return unknownCategoryValidationRuleCache;
+  const targetMap = getTransactionOverrideTargetMap();
+  const labels = Object.keys(targetMap)
+    .map(key => getTransactionOverrideTargetLabel(targetMap[key]));
+  unknownCategoryValidationRuleCache = SpreadsheetApp.newDataValidation()
+    .requireValueInList([...new Set(labels)], true)
+    .setAllowInvalid(false)
+    .build();
+  return unknownCategoryValidationRuleCache;
+}
+
+function setUnknownCategoryValidation(sheet, startRow, numRows) {
+  const ss = getFinanceSpreadsheet();
+  if (!ss.getSheetByName(LIFESTYLE_SHEET) || !ss.getSheetByName(MANDATORY_SHEET)) return;
+  sheet.getRange(startRow, UNKNOWN_CATEGORY_COLUMN, numRows, 1)
+    .setDataValidation(getUnknownCategoryValidationRule());
 }
 
 function deleteLedgerRow(row) {
@@ -702,7 +726,7 @@ function getFixedPoolNameForTarget(targetSheet) {
 // whatever it looked like the first time it was seen.
 // Columns: Transaction ID | Date | Description | Amount | Plaid Category
 //          (detailed, for display) | Merchant Name | Plaid Category (primary)
-//          | Plaid Category (detailed, raw)
+//          | Plaid Category (detailed, raw) | Assign to Category
 // The last three are carried specifically so resolveUnknownTransaction()
 // can auto-generate a precisely-matching Category Rule once you assign a
 // category — including the detailed category, needed to target something
@@ -908,6 +932,27 @@ function resolveUnknownTransaction(txnId, targetSheet, targetField) {
   }
 
   return { success: true, alsoResolved };
+}
+
+function assignUnknownTransactionFromSheet(txnId, selectedLabel) {
+  const target = getTransactionOverrideTargetMap()[String(selectedLabel || "").trim().toLowerCase()];
+  if (!target) {
+    throw new Error(`"${selectedLabel}" is not a valid category. Choose a value from the dropdown.`);
+  }
+
+  const outcome = resolveUnknownTransaction(txnId, target.targetSheet, target.targetField);
+  if (!outcome.success) throw new Error(outcome.error);
+  return outcome;
+}
+
+function recomputeAnnualRollupsForTargets(targets) {
+  const monthlySheets = new Set();
+  targets.forEach(target => {
+    if (target.targetSheet === LIFESTYLE_SHEET || target.targetSheet === MANDATORY_SHEET) {
+      monthlySheets.add(target.targetSheet);
+    }
+  });
+  monthlySheets.forEach(sheetName => recomputeAnnualRollup(getFinanceSheet(sheetName), sheetName));
 }
 
 /**
@@ -1197,13 +1242,7 @@ function processTransactionLedgerOverrideEdit(row, selectedLabel) {
     defaultTarget.targetField || ""
   ]]);
 
-  const affectedMonthlySheets = new Set();
-  [previousTarget, destination].forEach(target => {
-    if (target.targetSheet === LIFESTYLE_SHEET || target.targetSheet === MANDATORY_SHEET) {
-      affectedMonthlySheets.add(target.targetSheet);
-    }
-  });
-  affectedMonthlySheets.forEach(sheetName => recomputeAnnualRollup(getFinanceSheet(sheetName), sheetName));
+  recomputeAnnualRollupsForTargets([previousTarget, destination]);
   getFinanceSpreadsheet().toast(
     clearingOverride
       ? `Transaction restored to ${getTransactionOverrideTargetLabel(destination)}.`
@@ -1914,15 +1953,29 @@ function setupFinanceSheets() {
 
   if (!ss.getSheetByName(UNKNOWN_SHEET)) {
     const sheet = ss.insertSheet(UNKNOWN_SHEET);
-    sheet.getRange(1, 1, 1, 8).setValues([[
-      "Transaction ID", "Date", "Description", "Amount", "Plaid Category", "Merchant Name", "Plaid Category (primary)", "Plaid Category (detailed)"
+    sheet.getRange(1, 1, 1, 9).setValues([[
+      "Transaction ID", "Date", "Description", "Amount", "Plaid Category", "Merchant Name",
+      "Plaid Category (primary)", "Plaid Category (detailed)", "Assign to Category"
     ]]);
   }
+  const unknownSheet = ss.getSheetByName(UNKNOWN_SHEET);
+  if (unknownSheet.getMaxColumns() < UNKNOWN_CATEGORY_COLUMN) {
+    unknownSheet.insertColumnsAfter(
+      unknownSheet.getMaxColumns(),
+      UNKNOWN_CATEGORY_COLUMN - unknownSheet.getMaxColumns()
+    );
+  }
+  unknownSheet.getRange(1, UNKNOWN_CATEGORY_COLUMN).setValue("Assign to Category");
+  setUnknownCategoryValidation(
+    unknownSheet,
+    2,
+    Math.max(unknownSheet.getLastRow() - 1, 1)
+  );
 
   // Fixed pools (Travel + every category in the Mandatory Fixed Amounts
   // block) are no longer scaffolded here — syncFixedPoolsFromAnnualOverview()
   // creates each one automatically, sourcing its Annual Budget straight
   // from Annual Overview, the first time ensureMonthSectionsUpToDate() runs.
 
-  console.log("Finance sheet setup complete. Transaction Ledger category overrides are ready; fill in Category Rules and Annual Overview — Fixed pools are created automatically from it.");
+  console.log("Finance sheet setup complete. Transaction Ledger overrides and Uncategorized Transactions category dropdowns are ready; fill in Category Rules and Annual Overview — Fixed pools are created automatically from it.");
 }

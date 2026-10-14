@@ -266,6 +266,8 @@ function buildUnknownSectionText() {
   const unknowns = getAllUnknownTransactions();
   if (unknowns.length === 0) return "";
 
+  const unknownSheet = getFinanceSheet(UNKNOWN_SHEET);
+  const sheetUrl = `${getFinanceSpreadsheet().getUrl()}#gid=${unknownSheet.getSheetId()}`;
   const labels = listValidCategoryTargets()
     .map(t => t.targetSheet.startsWith("FixedPool:") ? t.targetSheet.split(":")[1] : (t.targetField || t.targetSheet))
     .filter(Boolean);
@@ -281,16 +283,18 @@ function buildUnknownSectionText() {
   return `
 <p><strong>UNCATEGORIZED TRANSACTIONS (${unknowns.length})</strong></p>
 ${uncategorizedList}
-<p><strong>To categorize these, reply to this email with one line per transaction:</strong></p>
-<p>&lt;transaction ID&gt;: &lt;category&gt;</p>
-<p><strong>Valid categories:</strong></p>
-${labelsList}
+  <p><a href="${sheetUrl}">Open the Uncategorized Transactions sheet</a> and choose a category from the <strong>Assign to Category</strong> dropdown for each transaction. Transactions with the same merchant and Plaid categories will be assigned together.</p>
+  <p>You can also categorize by replying to this email with one line per transaction:</p>
+  <p>&lt;transaction ID&gt;: &lt;category&gt;</p>
+  <p><strong>Valid categories:</strong></p>
+  ${labelsList}
 `;
 }
 
 /** Crude HTML-to-plain-text fallback for non-HTML email clients — display only, never re-parsed by anything (replies are parsed from HTML — see parseCategoryReply). */
 function stripHtmlTags(html) {
   return html
+    .replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, "$2 ($1)")
     .replace(/<li>/gi, "\n- ")
     .replace(/<\/li>/gi, "")
     .replace(/<br\s*\/?>/gi, "\n")

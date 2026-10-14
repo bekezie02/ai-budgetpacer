@@ -35,60 +35,112 @@ function ensureTransactionLedgerEditTrigger(spreadsheet) {
 }
 
 function handleTransactionLedgerEdit(event) {
-  if (!event || !event.range || event.range.getSheet().getName() !== LEDGER_SHEET) return;
+  if (!event || !event.range) return;
   const range = event.range;
+  const sheet = range.getSheet();
+  const sheetName = sheet.getName();
+  if (sheetName !== LEDGER_SHEET && sheetName !== UNKNOWN_SHEET) return;
+  const categoryColumn = sheetName === LEDGER_SHEET
+    ? LEDGER_OVERRIDE_COLUMN
+    : UNKNOWN_CATEGORY_COLUMN;
   const firstColumn = range.getColumn();
   const lastColumn = firstColumn + range.getNumColumns() - 1;
-  if (firstColumn > 9 || lastColumn < 9 || range.getLastRow() < 2) return;
+  if (firstColumn > categoryColumn || lastColumn < categoryColumn || range.getLastRow() < 2) return;
 
-  const sheet = range.getSheet();
   const firstRow = Math.max(2, range.getRow());
   const lastRow = range.getLastRow();
   const isSingleCellEdit = range.getNumRows() === 1 && range.getNumColumns() === 1;
   const previousValue = isSingleCellEdit ? event.oldValue : undefined;
+  const edits = [];
+  for (let row = firstRow; row <= lastRow; row++) {
+    const values = sheet.getRange(row, 1, 1, categoryColumn).getValues()[0];
+    edits.push({
+      row,
+      transactionId: values[0],
+      selectedLabel: values[categoryColumn - 1]
+    });
+  }
+
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
-    for (let row = firstRow; row <= lastRow; row++) {
-      try {
-        restoreTransactionLedgerOverrideSelection(row, row === firstRow ? previousValue : undefined);
-      } catch (error) {
-        const detail = error && error.message ? error.message : String(error);
-        console.error(`Could not restore the override selection on ledger row ${row}: ${detail}`);
-      }
-    }
+    edits.forEach(edit => restoreFinanceCategorySelection(
+      sheet,
+      sheetName,
+      edit,
+      isSingleCellEdit ? previousValue : undefined
+    ));
     sheet.getParent().toast(
-      "A finance sync or replacement is running. The edit was not applied; please retry shortly.",
-      "Transaction category not changed",
+      "A finance sync or replacement is running. The category change was not applied; please retry shortly.",
+      "Transaction not categorized",
       6
     );
     return;
   }
 
   try {
-    for (let row = firstRow; row <= lastRow; row++) {
-      const selectedLabel = sheet.getRange(row, 9).getValue();
+    let assignedCount = 0;
+    const assignedByCategory = {};
+    for (const edit of edits) {
+      if (!edit.transactionId || !edit.selectedLabel) continue;
       try {
-        processTransactionLedgerOverrideEdit(row, selectedLabel);
-      } catch (error) {
-        try {
-          restoreTransactionLedgerOverrideSelection(row, row === firstRow ? previousValue : undefined);
-        } catch (restoreError) {
-          const restoreDetail = restoreError && restoreError.message
-            ? restoreError.message
-            : String(restoreError);
-          console.error(`Could not restore the override selection on ledger row ${row}: ${restoreDetail}`);
+        if (sheetName === LEDGER_SHEET) {
+          processTransactionLedgerOverrideEdit(edit.row, edit.selectedLabel);
+        } else {
+          if (!getUnknownTransaction(edit.transactionId)) continue;
+          const outcome = assignUnknownTransactionFromSheet(edit.transactionId, edit.selectedLabel);
+          const count = 1 + outcome.alsoResolved.length;
+          assignedCount += count;
+          assignedByCategory[edit.selectedLabel] = (assignedByCategory[edit.selectedLabel] || 0) + count;
         }
+      } catch (error) {
         const detail = error && error.message ? error.message : String(error);
-        console.error(`Could not apply the transaction override on ledger row ${row}: ${detail}`);
+        console.error(`Could not apply the category selection on ${sheetName} row ${edit.row}: ${detail}`);
+        restoreFinanceCategorySelection(
+          sheet,
+          sheetName,
+          edit,
+          isSingleCellEdit ? previousValue : undefined
+        );
         sheet.getParent().toast(
-          `Row ${row}: ${detail}`,
-          "Transaction category not changed",
+          `Row ${edit.row}: ${detail}`,
+          "Transaction not categorized",
           8
         );
       }
     }
+    if (sheetName === UNKNOWN_SHEET && assignedCount > 0) {
+      const assignmentSummary = Object.entries(assignedByCategory)
+        .map(([category, count]) => `${count} to ${category}`)
+        .join("; ");
+      sheet.getParent().toast(
+        `Assigned ${assignedCount} transaction${assignedCount === 1 ? "" : "s"} (${assignmentSummary}).`,
+        "Unassigned transactions updated",
+        6
+      );
+    }
   } finally {
     lock.releaseLock();
+  }
+}
+
+function restoreFinanceCategorySelection(sheet, sheetName, edit, previousValue) {
+  try {
+    if (sheetName === LEDGER_SHEET) {
+      restoreTransactionLedgerOverrideSelection(
+        edit.row,
+        previousValue === undefined ? undefined : previousValue
+      );
+      return;
+    }
+    const unknowns = getAllUnknownTransactions();
+    const currentRow = unknowns.findIndex(txn => txn.transaction_id === edit.transactionId) + 2;
+    if (currentRow >= 2) {
+      sheet.getRange(currentRow, UNKNOWN_CATEGORY_COLUMN)
+        .setValue(previousValue === undefined ? "" : previousValue);
+    }
+  } catch (error) {
+    const detail = error && error.message ? error.message : String(error);
+    console.error(`Could not restore the category selection on ${sheetName} row ${edit.row}: ${detail}`);
   }
 }
 

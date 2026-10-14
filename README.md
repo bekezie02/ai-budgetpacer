@@ -2,10 +2,10 @@
 
 **AI BudgetPacer** is a Google Apps Script personal finance tracker that pulls transactions via Plaid, categorizes and ledgers them against an annual budget, and emails a daily deterministic + LLM-narrated summary.
 
-See also: [ARCHITECTUREOVERVIEW.md](./ARCHITECTUREOVERVIEW.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
+See also: [Project Changes Guide](./PROJECT_CHANGES_GUIDE.md) · [ARCHITECTUREOVERVIEW.md](./ARCHITECTUREOVERVIEW.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 
 ## What this is
-A daily-cron finance tracker: it syncs bank transactions from Plaid, categorizes them against user-defined rules, rolls them up into annual/monthly budget sheets, and emails a summary. Unrecognized transactions go into an "Unknown" bucket that the user resolves by **replying to email**, which the system parses and learns from.
+A daily-cron finance tracker: it syncs bank transactions from Plaid, categorizes them against user-defined rules, rolls them up into annual/monthly budget sheets, and emails a summary. Unrecognized transactions go into an "Unknown" bucket. Assign them from the sheet's category dropdown or, if preferred, reply to the notification email; either way, the system learns a rule for matching future transactions.
 
 ## Architecture philosophy
 - **Deterministic core, LLM only at the edges.** There is no LLM tool-orchestration/agent loop here. The LLM is used one-shot, for two things only:
@@ -20,6 +20,7 @@ A daily-cron finance tracker: it syncs bank transactions from Plaid, categorizes
 - For fixed pools, use `FixedPool:<pool name>` as the Category Rules target (for example, `FixedPool:Travel`). Existing rules or Ledger entries using a pool's bare name (for example, `Travel`) are recognized as that pool when its `Fixed - Travel` sheet exists.
 - A rule's Target Sheet can be `"Ignore"` — matching transactions (e.g. credit card payments, already counted when the original purchase posted) are skipped entirely: not tracked, not ledgered, not sent to Unknown.
 - Resolving an Unknown transaction auto-creates a matching Category Rule (if one doesn't already exist), so repeat merchants stop needing a reply.
+- The finance email lists unassigned transactions and links directly to the Uncategorized Transactions sheet. Choose a category in that row's **Assign to Category** dropdown; matching unassigned transactions are assigned together, and a sheet confirmation reports the result.
 - To reclassify one already-budgeted transaction without changing future transactions, select a value in that transaction's **Override Category** column in the Transaction Ledger. For example, move one dining transaction to **Fixed — Travel** while leaving the usual eating-out rule unchanged. Select **Use original category** to clear the override.
 
 ## Known limitations / decisions
@@ -70,7 +71,7 @@ This project runs on Google Apps Script, so configuration lives in **Script Prop
 4. **Set up your own spreadsheet** using `docs/SHEET_LAYOUT.md` as the reference: Annual Overview (with the Mandatory/Lifestyle/fixed-category/Travel blocks and Projected Annual Savings), Monthly LifeStyle Cost, Monthly Mandatory Cost, one Fixed pool sheet per fixed category + Travel, Uncategorized Transactions, Category Rules.
 5. **Link bank accounts via Plaid Link** and complete the handshake in `financeUtils.gs`.
 6. **Push and deploy**: `clasp push` to sync the code into your Apps Script project.
-7. **Run `setupFinanceSheets()`** (creates the Unknown sheet and any other structural setup) if starting fresh. After deploying updates to an existing spreadsheet, run it again to add the Transaction Ledger override columns, dropdown, and edit trigger.
+7. **Run `setupFinanceSheets()`** (creates the Unknown sheet and any other structural setup) if starting fresh. After deploying updates to an existing spreadsheet, run it again to add the Transaction Ledger override columns, Uncategorized Transactions dropdown, and edit trigger.
 8. **Wire up triggers**: a one-minute trigger for `checkInboxForTriggers()` (install with `setFinancialTrigger()`), daily sync and one-minute backfill-continuation triggers (both installed with `setDailyFinanceTrigger()`), and a 15-minute trigger for `checkForCategoryReplies()`.
 9. **Populate initial Category Rules** for known recurring merchants, including any `"Ignore"` rules (e.g. credit card payment transactions).
 10. **First run / backfill**: run `dailyFinanceCheck()` once. If the Plaid history takes longer than one execution, its saved cursors resume automatically each minute. The script sends a caught-up email when all active Items reach the latest available updates; no repeated manual run is needed.
