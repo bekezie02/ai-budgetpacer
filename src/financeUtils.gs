@@ -259,11 +259,10 @@ function fetchNextSyncPage(accessToken, cursor) {
     "secret": plaidSecret,
     "access_token": accessToken,
     "cursor": cursor,
-    // Smaller than Plaid's default (100) so each page finishes — and its
-    // cursor gets saved — well within Apps Script's execution time limit,
-    // even during a large backfill. More, smaller pages instead of fewer,
-    // bigger ones that risk never finishing.
-    "count": 50
+    // Keep pages small because each transaction can require several Sheets
+    // operations before the next cursor is saved. Smaller pages make timeout
+    // recovery progress reliably instead of repeatedly replaying a large page.
+    "count": 20
   };
 
   const requestOptions = {

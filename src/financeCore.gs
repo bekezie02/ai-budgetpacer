@@ -1287,7 +1287,7 @@ function runDailyFinanceSyncLocked() {
   // guaranteed to make forward progress from wherever the last one's saved
   // cursor left off, instead of repeatedly dying at the same point.
   const startTime = Date.now();
-  const TIME_BUDGET_MS = 5 * 60 * 1000; // 5 minutes
+  const TIME_BUDGET_MS = 3 * 60 * 1000; // leave time to persist backfill state before Apps Script's execution limit
 
   for (const itemId of itemIds) {
     const accessToken = financeScriptProperties.getProperty(`PLAID_ACCESS_TOKEN_${itemId}`);
@@ -1896,8 +1896,8 @@ function resyncTransactionsFromStart() {
     financeScriptProperties.deleteProperty(`PLAID_CURSOR_${itemId}`);
   });
 
-  console.log(`Plaid cursors cleared for ${itemIds.length} linked item(s). Starting sync from the beginning of each item's available history; spreadsheet data was not cleared.`);
-  return runDailyFinanceSync();
+  console.log(`Plaid cursors cleared for ${itemIds.length} linked item(s). Starting sync from the beginning of each item's available history; spreadsheet data was not cleared. The one-minute continuation trigger will resume any remaining pages.`);
+  return dailyFinanceCheck();
 }
 
 // =========================================================================
@@ -1906,8 +1906,8 @@ function resyncTransactionsFromStart() {
 // next runDailyFinanceSync() re-pulls full available transaction history
 // (filtered down to SYNC_START_DATE onward) instead of resuming where the
 // old spreadsheet's cursor left off. Run this once manually, then either
-// wait for the next daily trigger or call runDailyFinanceSync() /
-// dailyFinanceCheck() directly to backfill immediately.
+// wait for the next daily trigger or call dailyFinanceCheck() directly to
+// backfill immediately with automatic continuation enabled.
 //
 // Assumes the new spreadsheet already has Category Rules / Transaction
 // Ledger / Uncategorized Transactions / Fixed pool sheets in place — if

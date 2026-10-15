@@ -221,10 +221,19 @@ function setDailyFinanceTrigger() {
     .atHour(7)
     .create();
 
-  ScriptApp.newTrigger("continueDailyFinanceSync")
-    .timeBased()
-    .everyMinutes(1)
-    .create();
+  ensureDailyFinanceContinuationTrigger();
+}
+
+function ensureDailyFinanceContinuationTrigger() {
+  const triggerExists = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === "continueDailyFinanceSync"
+  );
+  if (!triggerExists) {
+    ScriptApp.newTrigger("continueDailyFinanceSync")
+      .timeBased()
+      .everyMinutes(1)
+      .create();
+  }
 }
 
 function resetDailyFinanceTrigger() {

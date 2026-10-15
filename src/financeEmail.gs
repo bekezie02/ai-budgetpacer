@@ -355,11 +355,32 @@ function sendFinanceSummaryEmail() {
  * actually changed something in the sheets.
  */
 function dailyFinanceCheck(isContinuation) {
-  if (!isContinuation) ensureMonthSectionsUpToDate();
-  const syncResult = runDailyFinanceSync();
-
+  ensureDailyFinanceContinuationTrigger();
   const backfillWasActive =
     financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_ACTIVE") === "true";
+  const itemIds = JSON.parse(financeScriptProperties.getProperty("PLAID_ITEM_IDS") || "[]");
+  const startsFromBeginning = itemIds.some(itemId =>
+    !financeScriptProperties.getProperty(`PLAID_CURSOR_${itemId}`)
+  );
+  if (!backfillWasActive) {
+    financeScriptProperties.setProperty("DAILY_FINANCE_BACKFILL_ACTIVE", "true");
+    financeScriptProperties.setProperty("DAILY_FINANCE_BACKFILL_HAS_CHANGES", "false");
+    financeScriptProperties.setProperty("DAILY_FINANCE_BACKFILL_UNCATEGORIZED_COUNT", "0");
+    financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_LAST_ERROR");
+  }
+  if (startsFromBeginning) {
+    financeScriptProperties.setProperty("DAILY_FINANCE_BACKFILL_STARTED_FROM_BEGINNING", "true");
+  }
+  if (!isContinuation) {
+    financeScriptProperties.deleteProperty("DAILY_FINANCE_MONTH_SECTIONS_READY");
+  }
+  if (financeScriptProperties.getProperty("DAILY_FINANCE_MONTH_SECTIONS_READY") !== "true") {
+    ensureMonthSectionsUpToDate();
+    financeScriptProperties.setProperty("DAILY_FINANCE_MONTH_SECTIONS_READY", "true");
+  }
+
+  const syncResult = runDailyFinanceSync();
+
   const accumulatedChanges =
     financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_HAS_CHANGES") === "true";
   const accumulatedUnknownCount = Number(
@@ -393,12 +414,20 @@ function dailyFinanceCheck(isContinuation) {
       String(accumulatedUnknownCount + syncResult.uncategorizedCount)
     );
     console.log("Daily transaction sync is still catching up; the one-minute continuation trigger will resume from the saved cursors.");
-    return;
+    return syncResult;
   }
 
   const hasChanges = accumulatedChanges || syncResult.hasChanges;
   const uncategorizedCount = accumulatedUnknownCount + syncResult.uncategorizedCount;
-  const completedBackfill = backfillWasActive || syncResult.startedFromBeginning;
+  const completedBackfill =
+    financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_STARTED_FROM_BEGINNING") === "true" ||
+    syncResult.startedFromBeginning;
+
+  financeScriptProperties.setProperty("DAILY_FINANCE_BACKFILL_HAS_CHANGES", String(hasChanges));
+  financeScriptProperties.setProperty(
+    "DAILY_FINANCE_BACKFILL_UNCATEGORIZED_COUNT",
+    String(uncategorizedCount)
+  );
 
   if (hasChanges) {
     sendFinanceSummaryEmail();
@@ -418,6 +447,9 @@ function dailyFinanceCheck(isContinuation) {
   financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_HAS_CHANGES");
   financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_UNCATEGORIZED_COUNT");
   financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_LAST_ERROR");
+  financeScriptProperties.deleteProperty("DAILY_FINANCE_BACKFILL_STARTED_FROM_BEGINNING");
+  financeScriptProperties.deleteProperty("DAILY_FINANCE_MONTH_SECTIONS_READY");
+  return syncResult;
 }
 
 function sendDailySyncCompleteEmail() {
