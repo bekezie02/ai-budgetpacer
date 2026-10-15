@@ -97,4 +97,6 @@ To cancel a staged replacement and start over, choose **Cancel replacement** in 
 
 Unassigned transactions can only be assigned from the Uncategorized Transactions sheet's dropdown; replies to the finance email are not processed as category assignments.
 
+On the first day of each month, after the Plaid sync catches up, the script sends a separate fixed-budget set-aside email for the month that just ended. It totals transactions by their dates in each `Fixed - <name>` sheet and suggests setting aside that month's net spending (purchases less refunds, not below $0). No email is sent when no fixed-budget transactions were recorded. If the sync needs continuation, the report waits until it completes.
+
 Automatically growing sheets (monthly sections, fixed-pool ledgers, Transaction Ledger, Uncategorized Transactions, Category Rules, and Plaid review sheets) extend their row capacity as needed; manual row expansion should not be necessary.

@@ -356,6 +356,7 @@ function sendFinanceSummaryEmail() {
  */
 function dailyFinanceCheck(isContinuation) {
   ensureDailyFinanceContinuationTrigger();
+  queuePreviousMonthFixedBudgetEmailIfDue();
   const backfillWasActive =
     financeScriptProperties.getProperty("DAILY_FINANCE_BACKFILL_ACTIVE") === "true";
   const itemIds = JSON.parse(financeScriptProperties.getProperty("PLAID_ITEM_IDS") || "[]");
@@ -429,6 +430,8 @@ function dailyFinanceCheck(isContinuation) {
     String(uncategorizedCount)
   );
 
+  sendPendingFixedBudgetAllocationEmail();
+
   if (hasChanges) {
     sendFinanceSummaryEmail();
   } else {
@@ -466,4 +469,144 @@ function sendDailySyncCompleteEmail() {
       `Completed: ${completedAt}\n` +
       `Tracked transaction window starts ${SYNC_START_DATE}.`
   });
+}
+
+function getPreviousMonthKey(date) {
+  const timeZone = Session.getScriptTimeZone();
+  const currentYearMonth = Utilities.formatDate(date, timeZone, "yyyy-MM").split("-");
+  const previousMonth = new Date(
+    Number(currentYearMonth[0]),
+    Number(currentYearMonth[1]) - 2,
+    1
+  );
+  return Utilities.formatDate(previousMonth, timeZone, "yyyy-MM");
+}
+
+function queuePreviousMonthFixedBudgetEmailIfDue() {
+  const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "d");
+  if (today !== "1") return;
+
+  const monthKey = getPreviousMonthKey(new Date());
+  const lastProcessedMonth = financeScriptProperties.getProperty(
+    "FIXED_BUDGET_ALLOCATION_LAST_PROCESSED_MONTH"
+  );
+  if (lastProcessedMonth === monthKey) return;
+
+  financeScriptProperties.setProperty("FIXED_BUDGET_ALLOCATION_PENDING_MONTH", monthKey);
+}
+
+function getFixedPoolMonthlyActivity(monthKey) {
+  const pools = [];
+  let transactionCount = 0;
+  let totalSuggestedAmount = 0;
+  const spreadsheet = getFinanceSpreadsheet();
+
+  spreadsheet.getSheets().forEach(sheet => {
+    const sheetName = sheet.getName();
+    if (!sheetName.startsWith(FIXED_POOL_PREFIX)) return;
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow < FIXED_POOL_LEDGER_START_ROW) return;
+
+    const rows = sheet.getRange(
+      FIXED_POOL_LEDGER_START_ROW,
+      1,
+      lastRow - FIXED_POOL_LEDGER_START_ROW + 1,
+      4
+    ).getValues();
+    let poolTransactions = 0;
+    let netSpend = 0;
+
+    rows.forEach(([dateValue, , amountValue, transactionId]) => {
+      if (!transactionId) return;
+      const date = dateValue instanceof Date
+        ? Utilities.formatDate(dateValue, Session.getScriptTimeZone(), "yyyy-MM")
+        : String(dateValue || "").trim().slice(0, 7);
+      const dateParts = date.match(/^(\d{4})-(\d{2})$/);
+      if (!dateParts || Number(dateParts[2]) < 1 || Number(dateParts[2]) > 12) {
+        throw new Error(`Invalid transaction date in "${sheetName}" for transaction ${transactionId}: "${dateValue}".`);
+      }
+      if (date !== monthKey) return;
+
+      const amount = Number(amountValue);
+      if (
+        amountValue === "" ||
+        amountValue === null ||
+        amountValue === undefined ||
+        !Number.isFinite(amount)
+      ) {
+        throw new Error(`Invalid transaction amount in "${sheetName}" for transaction ${transactionId}: "${amountValue}".`);
+      }
+      poolTransactions++;
+      netSpend += amount;
+    });
+
+    if (poolTransactions > 0) {
+      const suggestedAmount = Math.max(0, netSpend);
+      pools.push({
+        name: sheetName.slice(FIXED_POOL_PREFIX.length),
+        transactionCount: poolTransactions,
+        netSpend,
+        suggestedAmount
+      });
+      transactionCount += poolTransactions;
+      totalSuggestedAmount += suggestedAmount;
+    }
+  });
+
+  return { pools, transactionCount, totalSuggestedAmount };
+}
+
+function sendPendingFixedBudgetAllocationEmail() {
+  const monthKey = financeScriptProperties.getProperty("FIXED_BUDGET_ALLOCATION_PENDING_MONTH");
+  if (!monthKey) return;
+
+  const activity = getFixedPoolMonthlyActivity(monthKey);
+  const [year, month] = monthKey.split("-").map(Number);
+  const monthLabel = Utilities.formatDate(
+    new Date(year, month - 1, 1),
+    Session.getScriptTimeZone(),
+    "MMMM yyyy"
+  );
+
+  if (activity.transactionCount > 0) {
+    const rows = activity.pools.map(pool =>
+      `<tr><td>${escapeFinanceHtml(pool.name)}</td><td>${pool.transactionCount}</td>` +
+      `<td>${formatFinanceCurrency(pool.netSpend)}</td>` +
+      `<td>${formatFinanceCurrency(pool.suggestedAmount)}</td></tr>`
+    ).join("");
+    const htmlBody =
+      `<p>Here is the fixed-budget activity dated in <strong>${monthLabel}</strong>.</p>` +
+      `<p>The suggested set-aside matches each pool's net transactions for the month (spending less any refunds). It is an estimate, not an instruction to transfer funds.</p>` +
+      `<table border="1" cellpadding="6" cellspacing="0">` +
+      `<thead><tr><th>Fixed budget</th><th>Transactions</th><th>Net monthly activity</th><th>Suggested amount to set aside</th></tr></thead>` +
+      `<tbody>${rows}</tbody>` +
+      `<tfoot><tr><th colspan="3">Total suggested set-aside</th><th>${formatFinanceCurrency(activity.totalSuggestedAmount)}</th></tr></tfoot>` +
+      `</table>`;
+
+    GmailApp.sendEmail(
+      MY_EMAIL,
+      `Fixed Budget Set-Aside — ${monthLabel}`,
+      stripHtmlTags(htmlBody),
+      { htmlBody }
+    );
+  } else {
+    console.log(`No fixed-budget transactions found for ${monthLabel}; no set-aside email sent.`);
+  }
+
+  financeScriptProperties.setProperty("FIXED_BUDGET_ALLOCATION_LAST_PROCESSED_MONTH", monthKey);
+  financeScriptProperties.deleteProperty("FIXED_BUDGET_ALLOCATION_PENDING_MONTH");
+}
+
+function formatFinanceCurrency(amount) {
+  return `$${Number(amount).toFixed(2)}`;
+}
+
+function escapeFinanceHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
