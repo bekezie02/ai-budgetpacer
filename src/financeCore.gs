@@ -18,6 +18,10 @@ const FIXED_POOL_PREFIX = "Fixed - ";
 const FIXED_POOL_LEDGER_START_ROW = 5;
 const PLAID_REPLACEMENT_REVIEW_PREFIX = "Plaid Review ";
 const PLAID_REPLACEMENT_DATA_START_ROW = 7;
+const PLAID_REPLACEMENT_ACTION_ROW = 5;
+const PLAID_REPLACEMENT_ACTION_COLUMN = 2;
+const PLAID_REPLACEMENT_FINALIZE_ACTION = "Finalize replacement";
+const PLAID_REPLACEMENT_CANCEL_ACTION = "Cancel replacement";
 let financeSpreadsheetCache = null;
 let unknownCategoryValidationRuleCache = null;
 
@@ -795,8 +799,7 @@ function getAllUnknownTransactions() {
  * Enumerates every valid category a transaction could be assigned to,
  * built dynamically from what's actually in the sheets (field labels
  * under any month's section, plus every "Fixed - <Name>" sheet), plus the
- * fixed "Ignore" option — used both for the email's reply instructions and
- * for the reply parser's exact-match whitelist.
+ * fixed "Ignore" option — used to populate the sheet assignment dropdown.
  */
 function listValidCategoryTargets() {
   const targets = [];
@@ -824,24 +827,6 @@ function listValidCategoryTargets() {
   targets.push({ targetSheet: IGNORE_TARGET_SHEET, targetField: "" });
 
   return targets;
-}
-
-/**
- * Maps a human-facing category label (Monthly sheet field name, Fixed pool
- * name, or "Ignore") to its {targetSheet, targetField}. First-wins on
- * label collision across sheets — fine as long as field names stay
- * distinct, but worth knowing if you ever reuse a label like "Travel" in
- * both a Monthly sheet and a Fixed pool.
- */
-function buildCategoryLabelMap(validTargets) {
-  const map = {};
-  (validTargets || listValidCategoryTargets()).forEach(t => {
-    const label = t.targetSheet.startsWith("FixedPool:") ? t.targetSheet.split(":")[1] : (t.targetField || t.targetSheet);
-    if (!label) return;
-    const key = label.trim().toLowerCase();
-    if (!map[key]) map[key] = t;
-  });
-  return map;
 }
 
 /**
@@ -881,8 +866,8 @@ function addCategoryRuleIfMissing(merchantName, pfcPrimary, pfcDetailed, targetS
 
 /**
  * Assigns a transaction sitting in the Unknown bucket to a real category
- * (or to "Ignore") — called once a reply is parsed (see
- * checkForCategoryReplies in financeSchedule.gs). Applies it, records it,
+ * (or to "Ignore") — called when the sheet dropdown is selected. Applies
+ * it, records it,
  * removes it from Unknown, and auto-creates a matching Category Rule
  * (merchant + PFC primary + PFC detailed). Then sweeps the rest of the
  * Unknown bucket for any OTHER transaction with the exact same merchant +
@@ -917,7 +902,7 @@ function resolveUnknownTransaction(txnId, targetSheet, targetField) {
     if (result.success) {
       alsoResolved.push(match);
     } else {
-      // A single bad-date secondary match shouldn't fail the whole reply —
+      // A single bad-date secondary match shouldn't fail the whole assignment —
       // the primary transaction the person actually replied about already
       // succeeded. Log it and leave that one in Unknown for next time.
       console.warn(`Auto-resolve skipped for ${match.transaction_id} (matched ${txn.transaction_id}'s new rule):`, result.error);
@@ -1404,11 +1389,12 @@ function getPlaidReplacementReviewSheet(itemId) {
 
   if (!sheet) {
     sheet = ss.insertSheet(sheetName);
-    sheet.getRange(1, 1, 4, 2).setValues([
+    sheet.getRange(1, 1, 5, 2).setValues([
       ["Old Item to replace (select bank / Item ID)", ""],
       ["New Item ID", itemId],
       ["Staging status", "Ready to stage transactions"],
-      ["Instructions", ""]
+      ["Instructions", ""],
+      ["Replacement action", ""]
     ]);
     sheet.getRange(6, 1, 1, 11).setValues([[
       "Decision", "Status", "Transaction ID", "Date", "Amount", "Description",
@@ -1417,6 +1403,17 @@ function getPlaidReplacementReviewSheet(itemId) {
     ]]);
     sheet.setFrozenRows(6);
   }
+  sheet.getRange(PLAID_REPLACEMENT_ACTION_ROW, 1).setValue("Replacement action");
+  sheet.getRange(PLAID_REPLACEMENT_ACTION_ROW, PLAID_REPLACEMENT_ACTION_COLUMN)
+    .setDataValidation(SpreadsheetApp.newDataValidation()
+      .requireValueInList([
+        PLAID_REPLACEMENT_FINALIZE_ACTION,
+        PLAID_REPLACEMENT_CANCEL_ACTION
+      ], true)
+      .setAllowInvalid(false)
+      .build())
+    .setNote("Finalize imports the staged decisions and replaces the selected active Item. Cancel deletes this review sheet and pending local Item credentials; cancellation is blocked after any transactions have been imported or replaced.");
+  ensureTransactionLedgerEditTrigger(ss);
   const oldItemIds = JSON.parse(financeScriptProperties.getProperty("PLAID_ITEM_IDS") || "[]");
   const oldItemOptions = oldItemIds.map(oldItemId => {
     const bankName = getPlaidItemInstitutionName(oldItemId);
@@ -1436,7 +1433,7 @@ function getPlaidReplacementReviewSheet(itemId) {
     if (matchingOption) sheet.getRange(1, 2).setValue(matchingOption);
   }
   sheet.getRange(4, 2).setValue(
-    "Select the old bank/Item to replace in B1. Unique exact date, amount, and description matches are set to REPLACE. All other transactions default to IMPORT; change Decision to SKIP for rows you do not want. REVIEW status flags multiple possible matches."
+    "Select the old bank/Item in B1. Review every decision in column A. Use the Replacement action dropdown in B5 to finalize or cancel."
   );
   return sheet;
 }
@@ -1759,6 +1756,8 @@ function finalizePlaidItemReplacementLocked() {
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_STARTED_NOTIFIED_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_COMPLETE_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_LAST_ERROR");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_REVIEW_SHEET_ID");
@@ -1838,6 +1837,8 @@ function cancelPlaidItemReplacementLocked() {
   financeScriptProperties.deleteProperty("PLAID_PENDING_REPLACEMENT_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_STARTED_NOTIFIED_ITEM_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_COMPLETE_ITEM_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_LINK_STARTED_AT");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_LINK_LAST_ERROR");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_STAGING_LAST_ERROR");
@@ -1858,7 +1859,7 @@ function cancelPlaidItemReplacementLocked() {
 // =========================================================================
 // RE-SYNC FROM THE START — clears only Plaid cursors for the active linked
 // items, then replays their available history through the normal sync path.
-// The Gmail reply thread and existing spreadsheet data are left untouched.
+// Existing spreadsheet data is left untouched.
 // =========================================================================
 function resyncTransactionsFromStart() {
   const itemIds = JSON.parse(financeScriptProperties.getProperty('PLAID_ITEM_IDS') || "[]");
@@ -1877,7 +1878,7 @@ function resyncTransactionsFromStart() {
     financeScriptProperties.deleteProperty(`PLAID_CURSOR_${itemId}`);
   });
 
-  console.log(`Plaid cursors cleared for ${itemIds.length} linked item(s). Starting sync from the beginning of each item's available history. Gmail reply thread and spreadsheet data were not cleared.`);
+  console.log(`Plaid cursors cleared for ${itemIds.length} linked item(s). Starting sync from the beginning of each item's available history; spreadsheet data was not cleared.`);
   return runDailyFinanceSync();
 }
 
@@ -1903,8 +1904,6 @@ function startFreshFinanceSheet(newSpreadsheetName) {
     financeScriptProperties.deleteProperty(`PLAID_CURSOR_${itemId}`);
   });
 
-  financeScriptProperties.deleteProperty('FINANCE_REPLY_THREAD_ID');
-
   console.log(`Finance target switched to "${newSpreadsheetName}". Cursors cleared for ${itemIds.length} item(s) — the next sync will pull full available history, filtered to ${SYNC_START_DATE} onward.`);
 }
 
@@ -1914,6 +1913,9 @@ function startFreshFinanceSheet(newSpreadsheetName) {
 // =========================================================================
 function setupFinanceSheets() {
   const ss = getFinanceSpreadsheet();
+  removeCategoryReplyTriggers();
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
+  financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
 
   if (!ss.getSheetByName(RULES_SHEET)) {
     const sheet = ss.insertSheet(RULES_SHEET);
@@ -1977,5 +1979,5 @@ function setupFinanceSheets() {
   // creates each one automatically, sourcing its Annual Budget straight
   // from Annual Overview, the first time ensureMonthSectionsUpToDate() runs.
 
-  console.log("Finance sheet setup complete. Transaction Ledger overrides and Uncategorized Transactions category dropdowns are ready; fill in Category Rules and Annual Overview — Fixed pools are created automatically from it.");
+  console.log("Finance sheet setup complete. Transaction Ledger overrides, Uncategorized Transactions dropdowns, and the spreadsheet edit trigger are ready; fill in Category Rules and Annual Overview — Fixed pools are created automatically from it.");
 }

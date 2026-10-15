@@ -1,10 +1,7 @@
 // =========================================================================
 // FINANCE EMAIL — uses the LLM (via llm() from util.gs, same Apps Script
-// project) in exactly two places: generateFinanceEmailSummary() and
-// parseCategoryReply(). Everything else here is deterministic — the model
-// is only asked to write feedback about numbers it's given, or to parse a
-// reply against a fixed whitelist, never to decide what the numbers are
-// or which category is "closest."
+// project) only to generate the qualitative finance summary. Everything
+// else here is deterministic.
 // =========================================================================
 const ANNUAL_SAVINGS_TARGET_LABEL = "Projected Annual Savings";
 const MANDATORY_ANNUAL_TARGET_LABEL = "Total Mandatory Costs Excluding Fixed Amounts";
@@ -194,9 +191,9 @@ CRITICAL — read this before writing anything:
   impression — every percentUsed figure below is already computed, don't recompute or estimate
   your own.
  
-* ${snapshot.unknownCount} transaction(s) are currently sitting uncategorized, waiting on a
-  reply to be filed into a budget category (see the list below this email). Mention this only
-  if the count is greater than 0, and frame it as the next action to take, not a problem.
+* ${snapshot.unknownCount} transaction(s) are currently sitting uncategorized, waiting to be
+  assigned from the Uncategorized Transactions sheet linked below. Mention this only if the
+  count is greater than 0, and frame it as the next action to take, not a problem.
  
 If (and only if) hasAnyDataThisYear is true, cover:
  
@@ -268,30 +265,21 @@ function buildUnknownSectionText() {
 
   const unknownSheet = getFinanceSheet(UNKNOWN_SHEET);
   const sheetUrl = `${getFinanceSpreadsheet().getUrl()}#gid=${unknownSheet.getSheetId()}`;
-  const labels = listValidCategoryTargets()
-    .map(t => t.targetSheet.startsWith("FixedPool:") ? t.targetSheet.split(":")[1] : (t.targetField || t.targetSheet))
-    .filter(Boolean);
-
   const lines = unknowns.map(u => {
     const plaidCategory = u.rawCategory ? ` (Plaid: ${u.rawCategory})` : "";
     return `<li>[${u.transaction_id}] ${u.date} — ${u.name} — $${u.amount}${plaidCategory}</li>`;
   });
 
   const uncategorizedList = `<ul>${lines.join("")}</ul>`;
-  const labelsList = `<ul>${labels.map(l => `<li>${l}</li>`).join("")}</ul>`;
 
   return `
 <p><strong>UNCATEGORIZED TRANSACTIONS (${unknowns.length})</strong></p>
 ${uncategorizedList}
   <p><a href="${sheetUrl}">Open the Uncategorized Transactions sheet</a> and choose a category from the <strong>Assign to Category</strong> dropdown for each transaction. Transactions with the same merchant and Plaid categories will be assigned together.</p>
-  <p>You can also categorize by replying to this email with one line per transaction:</p>
-  <p>&lt;transaction ID&gt;: &lt;category&gt;</p>
-  <p><strong>Valid categories:</strong></p>
-  ${labelsList}
 `;
 }
 
-/** Crude HTML-to-plain-text fallback for non-HTML email clients — display only, never re-parsed by anything (replies are parsed from HTML — see parseCategoryReply). */
+/** Crude HTML-to-plain-text fallback for non-HTML email clients. */
 function stripHtmlTags(html) {
   return html
     .replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, "$2 ($1)")
@@ -308,64 +296,12 @@ function stripHtmlTags(html) {
 }
 
 /**
- * Parses a reply's HTML into {transactionId, category} pairs. Reads the
- * raw HTML (not a separately-maintained plain-text copy) so there's only
- * one structure for the Unknown-transactions list to stay in sync — the
- * same buildUnknownSectionText() HTML that gets sent is what gets quoted
- * back in a reply and parsed here. Deliberately permissive on the category
- * text — validation against the exact-match whitelist happens downstream
- * in checkForCategoryReplies(), so a near-miss category gets reported back
- * to you instead of silently mis-filed by the LLM guessing the "closest" one.
- */
-function parseCategoryReply(replyPlaintext, validLabels) {
-  const prompt = `
-You are parsing the plaintext body of an email reply that assigns finance transaction IDs to
-categories. Only parse the person's own newly written text.
-
-Transaction IDs in the original (quoted) email are written in square brackets, like [abc123].
-
-Valid categories (for reference only — do not correct or guess-match, pass through what the
-person actually wrote):
-${validLabels.join(", ")}
-
-Email reply PlainText:
-"""
-${replyPlaintext}
-"""
-
-Return ONLY a JSON array (no markdown, no preamble) of objects: {"transactionId": "...", "category": "..."}.
-Only include entries that clearly reference a transaction ID from the original email.
-`;
-  const result = llm(prompt, { reasoningEffort: "low" });
-  if (!result.success) return { success: false, error: result.error };
-
-  try {
-    const clean = result.data.replace(/```json|```/g, "").trim();
-    const parsed = JSON.parse(clean);
-    const data = Array.isArray(parsed) ? parsed : [parsed];
-    if (!data.every(entry => entry && typeof entry === "object" && !Array.isArray(entry))) {
-      return { success: false, error: "LLM did not return transaction assignment objects" };
-    }
-    return { success: true, data };
-  } catch (e) {
-    return { success: false, error: "Failed to parse LLM JSON: " + e.toString() };
-  }
-}
-
-/**
- * Sends the email as HTML (with an auto-derived plain-text fallback for
- * non-HTML clients — display only, not what replies get parsed from) and
- * returns the sent thread's ID. GmailApp.sendEmail doesn't hand back the
- * sent message, so look it up immediately after — safe since Gmail sends
- * are synchronous and this runs at most a few times/day, so there's no
- * ambiguity about which thread it is.
+ * Sends the email as HTML with an auto-derived plain-text fallback for
+ * non-HTML clients.
  */
 function sendFinanceEmail(htmlBody, monthName) {
   const subject = `Finance Summary — ${monthName}`;
   GmailApp.sendEmail(MY_EMAIL, subject, stripHtmlTags(htmlBody), { htmlBody: htmlBody });
-
-  const threads = GmailApp.search(`in:sent subject:"${subject}" to:${MY_EMAIL}`, 0, 1);
-  return threads.length > 0 ? threads[0].getId() : null;
 }
 
 const FALLBACK_SUMMARY_HTML = "<p>This month's narrative summary couldn't be generated right now — the numbers and any uncategorized transactions are below.</p>";
@@ -397,12 +333,8 @@ function getSummaryHtmlWithRetry(snapshot, attempts) {
 }
 
 /**
- * Builds and sends the finance summary email, and re-points (or clears)
- * FINANCE_REPLY_THREAD_ID based on whatever's left in the Unknown bucket.
- * Called by the daily cron (gated on hasChanges) and by
- * checkForCategoryReplies() (unconditionally, right after resolving
- * replies) so the sheets/email reflect new categorizations immediately
- * instead of waiting for the next day's run.
+ * Builds and sends the finance summary email. Called by the daily cron
+ * when a sync changes spreadsheet data.
  *
  * The narrative summary is best-effort: if the LLM call fails or its
  * output is truncated, the email still sends with a fallback line rather
@@ -415,13 +347,7 @@ function sendFinanceSummaryEmail() {
 
   const unknownSection = buildUnknownSectionText();
   const htmlBody = summaryHtml + unknownSection;
-  const threadId = sendFinanceEmail(htmlBody, snapshot.monthName);
-
-  if (unknownSection) {
-    financeScriptProperties.setProperty('FINANCE_REPLY_THREAD_ID', threadId || "");
-  } else {
-    financeScriptProperties.deleteProperty('FINANCE_REPLY_THREAD_ID');
-  }
+  sendFinanceEmail(htmlBody, snapshot.monthName);
 }
 
 /**

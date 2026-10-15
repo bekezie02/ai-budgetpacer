@@ -1,4 +1,5 @@
 function setFinancialTrigger() {
+  removeCategoryReplyTriggers();
   ScriptApp.getProjectTriggers().forEach(trigger => {
     if (trigger.getHandlerFunction() === "checkInboxForTriggers") {
       ScriptApp.deleteTrigger(trigger);
@@ -39,6 +40,10 @@ function handleTransactionLedgerEdit(event) {
   const range = event.range;
   const sheet = range.getSheet();
   const sheetName = sheet.getName();
+  if (sheetName.startsWith(PLAID_REPLACEMENT_REVIEW_PREFIX)) {
+    handlePlaidReplacementActionEdit(event);
+    return;
+  }
   if (sheetName !== LEDGER_SHEET && sheetName !== UNKNOWN_SHEET) return;
   const categoryColumn = sheetName === LEDGER_SHEET
     ? LEDGER_OVERRIDE_COLUMN
@@ -123,6 +128,55 @@ function handleTransactionLedgerEdit(event) {
   }
 }
 
+function handlePlaidReplacementActionEdit(event) {
+  const range = event.range;
+  if (
+    range.getNumRows() !== 1 ||
+    range.getNumColumns() !== 1 ||
+    range.getRow() !== PLAID_REPLACEMENT_ACTION_ROW ||
+    range.getColumn() !== PLAID_REPLACEMENT_ACTION_COLUMN
+  ) return;
+
+  const sheet = range.getSheet();
+  const action = String(range.getValue() || "").trim();
+  const itemId = String(sheet.getRange(2, 2).getValue() || "").trim();
+  if (!itemId || !action) return;
+  range.clearContent();
+
+  try {
+    if (action === PLAID_REPLACEMENT_FINALIZE_ACTION) {
+      const result = finalizePlaidItemReplacement();
+      if (result.status === "in_progress") {
+        sheet.getParent().toast(
+          "Finalization is running in batches and will continue automatically.",
+          "Plaid replacement in progress",
+          8
+        );
+        return;
+      }
+      sendPlaidReplacementFinalizationEmail(result);
+      sheet.getParent().toast("Plaid Item replacement completed.", "Replacement complete", 8);
+      return;
+    }
+
+    if (action === PLAID_REPLACEMENT_CANCEL_ACTION) {
+      cancelPlaidItemReplacement();
+      sheet.getParent().toast(
+        "The staged replacement was cancelled. The active Item and finance data were not changed.",
+        "Replacement cancelled",
+        8
+      );
+      return;
+    }
+  } catch (error) {
+    const detail = error && error.message ? error.message : String(error);
+    const currentSheet = getFinanceSpreadsheet().getSheetByName(sheet.getName());
+    if (currentSheet) currentSheet.getRange(4, 2).setValue(`Last action failed: ${detail}`);
+    sheet.getParent().toast(detail, "Plaid replacement action failed", 10);
+    console.error(`Could not apply Plaid replacement action for Item ${itemId}: ${detail}`);
+  }
+}
+
 function restoreFinanceCategorySelection(sheet, sheetName, edit, previousValue) {
   try {
     if (sheetName === LEDGER_SHEET) {
@@ -151,6 +205,7 @@ function restoreFinanceCategorySelection(sheet, sheetName, edit, previousValue) 
 // financeEmail.gs.
 // =========================================================================
 function setDailyFinanceTrigger() {
+  removeCategoryReplyTriggers();
   ScriptApp.getProjectTriggers().forEach(trigger => {
     if (
       trigger.getHandlerFunction() === "dailyFinanceCheck" ||
@@ -189,31 +244,13 @@ function continueDailyFinanceSync() {
   dailyFinanceCheck(true);
 }
 
-// =========================================================================
-// Category-reply trigger — watches the single outstanding finance-summary
-// thread (if any) for replies categorizing Unknown-bucket transactions.
-// See checkForCategoryReplies() below.
-// =========================================================================
-function setCategoryReplyTrigger() {
+function removeCategoryReplyTriggers() {
   ScriptApp.getProjectTriggers().forEach(trigger => {
     if (trigger.getHandlerFunction() === "checkForCategoryReplies") {
       ScriptApp.deleteTrigger(trigger);
     }
   });
-
-  ScriptApp.newTrigger("checkForCategoryReplies")
-    .timeBased()
-    .everyMinutes(5)
-    .create();
-}
-
-function resetCategoryReplyTrigger() {
-  ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === "checkForCategoryReplies") {
-      ScriptApp.deleteTrigger(trigger);
-    }
-  });
-  setCategoryReplyTrigger();
+  financeScriptProperties.deleteProperty("FINANCE_REPLY_THREAD_ID");
 }
 
 // =========================================================================
@@ -298,7 +335,7 @@ function checkInboxForTriggers() {
 
   checkPendingPlaidReplacementLink();
   checkPendingPlaidReplacementStaging();
-  checkPendingPlaidReplacementApproval();
+  continuePendingPlaidReplacementFinalization();
 }
 
 function checkPendingPlaidReplacementLink() {
@@ -328,10 +365,7 @@ function checkPendingPlaidReplacementLink() {
 function checkPendingPlaidReplacementStaging(linkMessage) {
   const itemId = financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID');
   if (!itemId) return;
-  if (
-    financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_ITEM_ID') === itemId &&
-    financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_THREAD_ID')
-  ) return;
+  if (financeScriptProperties.getProperty("PLAID_REPLACEMENT_STAGING_COMPLETE_ITEM_ID") === itemId) return;
 
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return;
@@ -339,16 +373,15 @@ function checkPendingPlaidReplacementStaging(linkMessage) {
   try {
     const currentItemId = financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID');
     if (!currentItemId || currentItemId !== itemId) return;
-    if (
-      financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_ITEM_ID') === itemId &&
-      financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_THREAD_ID')
-    ) return;
+    if (financeScriptProperties.getProperty("PLAID_REPLACEMENT_STAGING_COMPLETE_ITEM_ID") === itemId) return;
 
+    sendPlaidReplacementStagingStartedEmail(itemId);
     const result = stagePendingPlaidItemTransactionsLocked();
     if (result.status === "in_progress") return;
 
     financeScriptProperties.deleteProperty('PLAID_REPLACEMENT_STAGING_LAST_ERROR');
     sendPlaidReplacementReviewEmail(itemId, linkMessage);
+    financeScriptProperties.setProperty("PLAID_REPLACEMENT_STAGING_COMPLETE_ITEM_ID", itemId);
   } catch (error) {
     const message = error.message || String(error);
     if (financeScriptProperties.getProperty('PLAID_REPLACEMENT_STAGING_LAST_ERROR') !== message) {
@@ -366,6 +399,23 @@ function checkPendingPlaidReplacementStaging(linkMessage) {
   }
 }
 
+function sendPlaidReplacementStagingStartedEmail(itemId) {
+  if (financeScriptProperties.getProperty("PLAID_REPLACEMENT_STAGING_STARTED_NOTIFIED_ITEM_ID") === itemId) return;
+  const reviewSheet = getPlaidReplacementReviewSheet(itemId);
+  reviewSheet.getRange(3, 2).setValue("Staging in progress — fetching available transactions.");
+  const reviewUrl = `${getFinanceSpreadsheet().getUrl()}#gid=${reviewSheet.getSheetId()}`;
+  MailApp.sendEmail({
+    to: MY_EMAIL,
+    subject: `Plaid Replacement Staging Started: ${itemId}`,
+    body:
+      `Transaction staging has started for the new Plaid Item ${itemId}.\n\n` +
+      `The script is fetching and adding transactions to the review sheet in resumable batches. ` +
+      `You will receive another email when staging is complete.\n\n` +
+      `Review sheet: ${reviewUrl}`
+  });
+  financeScriptProperties.setProperty("PLAID_REPLACEMENT_STAGING_STARTED_NOTIFIED_ITEM_ID", itemId);
+}
+
 function sendPlaidReplacementReviewEmail(itemId, linkMessage) {
   const subject = `Plaid Replacement Review: ${itemId}`;
   const reviewSheet = getPlaidReplacementReviewSheet(itemId);
@@ -374,218 +424,51 @@ function sendPlaidReplacementReviewEmail(itemId, linkMessage) {
     `Review the staged transactions here: ${reviewUrl}\n` +
     `All available transactions for the current-year window have been staged. Choose the old bank/Item to replace from the ordered dropdown in cell B1; each option shows its institution name and Item ID. Decision is pre-filled: a unique exact date, amount, and description match is REPLACE <old transaction ID>; all other transactions default to IMPORT. Change IMPORT to SKIP in column A for any transaction you do not want to import. ` +
     `Status REVIEW flags rows with multiple possible matches in column K; check these carefully because their default IMPORT could create a duplicate. REPLACE removes the old Ledger/Unknown entry before applying the new Item's transaction ID. ` +
-    `Then reply to this email with exactly:\nFINALIZE ${itemId}\n\n` +
-    `The replacement will not be finalized until every staged transaction has a valid decision.\n\n` +
-    `To cancel and start over, reply with exactly:\nCANCEL ${itemId}\n` +
-    `Cancellation deletes this replacement's review sheet and pending local Item credentials. It is refused if any transaction has already been imported or replaced, and it does not remove the Item from Plaid.`;
+    `When ready, use the Replacement action dropdown in cell B5 to finalize or cancel. Finalization requires every staged transaction to have a valid decision and resumes automatically if it takes multiple batches. ` +
+    `Cancellation deletes the review sheet and pending local Item credentials, is refused after any transaction has been imported or replaced, and does not remove the Item from Plaid.`;
 
-  GmailApp.sendEmail(MY_EMAIL, subject, body);
-  const sentThreads = GmailApp.search(
-    `in:sent to:${MY_EMAIL} subject:"${subject}" newer_than:1d`,
-    0,
-    10
-  );
-  const sentThread = sentThreads.find(thread => thread.getFirstMessageSubject() === subject);
-  if (!sentThread) {
-    throw new Error(`Sent the Plaid replacement review email, but could not locate its Gmail thread for approval tracking (${itemId}).`);
-  }
-
-  sentThread.markRead();
-  financeScriptProperties.setProperty('PLAID_REPLACEMENT_APPROVAL_THREAD_ID', sentThread.getId());
-  financeScriptProperties.setProperty('PLAID_REPLACEMENT_APPROVAL_ITEM_ID', itemId);
+  MailApp.sendEmail(MY_EMAIL, subject, body);
 }
 
-function checkPendingPlaidReplacementApproval() {
-  const threadId = financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_THREAD_ID');
-  const expectedItemId = financeScriptProperties.getProperty('PLAID_REPLACEMENT_APPROVAL_ITEM_ID');
-  const pendingItemId = financeScriptProperties.getProperty('PLAID_PENDING_REPLACEMENT_ITEM_ID');
-  if (!threadId || !expectedItemId || expectedItemId !== pendingItemId) return;
-
-  const thread = GmailApp.getThreadById(threadId);
-  if (!thread) {
-    throw new Error(`Could not find the Plaid replacement approval thread for Item ${expectedItemId}.`);
-  }
-
-  const reply = thread.getMessages().find(message => {
-    if (!message.isUnread()) return false;
-    const from = message.getFrom();
-    const emailMatch = from.match(/<([^>]+)>/);
-    const senderEmail = (emailMatch ? emailMatch[1] : from).trim().toLowerCase();
-    return senderEmail === MY_EMAIL.toLowerCase();
-  });
-  if (!reply) {
-    if (financeScriptProperties.getProperty('PLAID_REPLACEMENT_FINALIZATION_ITEM_ID') === expectedItemId) {
-      processPendingPlaidReplacementFinalization(thread, expectedItemId);
-    }
-    return;
-  }
-
-  reply.markRead();
-  const replyCommand = getPlaidReplacementReplyCommand(reply);
-  if (replyCommand.toUpperCase() === `CANCEL ${expectedItemId}`.toUpperCase()) {
-    let result;
-    try {
-      result = cancelPlaidItemReplacement();
-    } catch (error) {
-      thread.reply(
-        `The Plaid Item replacement was not cancelled:\n${error.message || error}\n\n` +
-        `If no transactions have been imported or replaced, reply again with exactly:\nCANCEL ${expectedItemId}`
-      );
-      return;
-    }
-
-    thread.reply(
-      `Plaid Item replacement cancelled.\n` +
-      `Pending Item: ${expectedItemId}\n` +
-      `Review sheet deleted: ${result.review_sheet_deleted ? "yes" : "no"}\n` +
-      `The Item itself was not removed from Plaid.`
-    );
-    return;
-  }
-
-  if (replyCommand.toUpperCase() !== `FINALIZE ${expectedItemId}`.toUpperCase()) {
-    thread.reply(
-      `No action was taken. Put exactly one of these commands on the first nonblank line of your reply:\n` +
-      `FINALIZE ${expectedItemId}\n` +
-      `CANCEL ${expectedItemId}`
-    );
-    return;
-  }
-
-  financeScriptProperties.setProperty('PLAID_REPLACEMENT_FINALIZATION_ITEM_ID', expectedItemId);
-  processPendingPlaidReplacementFinalization(thread, expectedItemId);
-}
-
-function processPendingPlaidReplacementFinalization(thread, itemId) {
+function continuePendingPlaidReplacementFinalization() {
+  const itemId = financeScriptProperties.getProperty("PLAID_REPLACEMENT_FINALIZATION_ITEM_ID");
+  if (!itemId) return;
   try {
     const result = finalizePlaidItemReplacement();
-    if (result.status === "in_progress") {
-      if (financeScriptProperties.getProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID") !== itemId) {
-        thread.reply(
-          `Plaid Item replacement finalization is continuing in resumable batches.\n` +
-          `Item: ${itemId}\n` +
-          `No further reply is needed; the scheduled trigger will continue and email when complete.`
-        );
-        financeScriptProperties.setProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID", itemId);
-      }
-      return;
-    }
-
-    const sheetCleanup = result.review_sheet_deleted
-      ? "The replacement review sheet was deleted."
-      : `The replacement is complete, but its review sheet could not be deleted: ${result.review_sheet_delete_error}`;
-    thread.reply(
-      `Plaid Item replacement completed.\n` +
-      `Old Item: ${result.old_item_id}\n` +
-      `New Item: ${result.new_item_id}\n` +
-      `The new Item's access token and staged cursor are retained; the old Item's token and cursor were removed.\n` +
-      sheetCleanup
-    );
+    if (result.status === "in_progress") return;
+    sendPlaidReplacementFinalizationEmail(result);
   } catch (error) {
-    financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_ITEM_ID");
-    financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_FINALIZATION_NOTIFIED_ITEM_ID");
-    thread.reply(`The Plaid Item replacement was not finalized:\n${error.message || error}\n\nAfter addressing the issue, reply again with exactly:\nFINALIZE ${itemId}`);
-  }
-}
-
-function getPlaidReplacementReplyCommand(messageObject) {
-  const replyText = extractNewReplyOnly(messageObject);
-  const firstReplyLine = replyText.split(/\r?\n/).find(line => line.trim() && !line.trim().startsWith(">"));
-  return firstReplyLine ? firstReplyLine.trim() : "";
-}
-
-function extractNewReplyOnly(messageObject) {
-  // 1. Use plain text body to immediately save ~80% of token weight
-  let body = messageObject.getPlainBody();
-  
-  // 2. Common headers that mark where the old thread history begins
-  const quoteMarkers = [
-    /\bOn\s+.*\s+wrote:/i,                                // Gmail standard: "On [Date], [Name] wrote:"
-    /-----Original Message-----/i,                        // Outlook standard
-    /From:\s*.*[\r\n]+Sent:\s*/i,                         // Windows Live / Outlook variant
-    /From:\s*.*\s*<.*>\s*[\r\n]+Date:/i,                  // Apple Mail variant
-    /_\s*[\r\n]+From:\s*/i                                // General webmail delimiters
-  ];
-  
-  // 3. Split the text at the first matching marker found
-  for (let marker of quoteMarkers) {
-    let parts = body.split(marker);
-    if (parts.length > 1) {
-      body = parts[0]; // Keep only the text BEFORE the marker
-      break; 
-    }
-  }
-  return body.trim();
-}
-
-// =========================================================================
-// Watches the single stored finance-summary thread ID for unread replies,
-// parses them into {transactionId, category} via the LLM, resolves any
-// that match the exact-match category whitelist, emails a per-line
-// confirmation, and — if anything was resolved — sends a refreshed summary
-// email right away rather than waiting for tomorrow's cron.
-// =========================================================================
-function checkForCategoryReplies() {
-  const threadId = financeScriptProperties.getProperty('FINANCE_REPLY_THREAD_ID');
-  if (!threadId) return; // nothing outstanding to watch for
-
-  const thread = GmailApp.getThreadById(threadId);
-  if (!thread) {
-    financeScriptProperties.deleteProperty('FINANCE_REPLY_THREAD_ID');
-    return;
-  }
-
-  const unreadReplies = thread.getMessages().filter(m => m.isUnread());
-  if (unreadReplies.length === 0) return;
-  const labelMap = buildCategoryLabelMap(listValidCategoryTargets());
-  const validLabels = Object.keys(labelMap);
-  const results = [];
-  let resolvedCount = 0;
-  for(let msg of unreadReplies) {
-    // NEW LINE: Extracts text-only and slices off historical thread junk
-    // 1. Clean the text using plain text and regex splitting
-    const cleanReplyText = extractNewReplyOnly(msg);
-    // 2. SAFETY GUARD: 1 token is roughly 4 characters. 
-    // 8,000 token limit means a max of ~32,000 characters. 
-    // Since an automated categorical reply should be very short, let's cap it strictly at 4,000 characters (~1,000 tokens).
-    if (cleanReplyText.length > 4000) {
-      console.warn(`Skipping message ${msg.getId()} — Body size (${cleanReplyText.length} chars) is still too large for LLM.`);
-      msg.markRead(); // Mark read so it doesn't loop forever, or remove this line to keep it unread.
-      continue;       // Safely skip this iteration and check the next email
-    }
-    const parsed = parseCategoryReply(cleanReplyText, validLabels);
-    msg.markRead();
-    if (!parsed.success) {
-      console.warn("Failed to parse category reply:", parsed.error);
-      continue;
-    }
-    parsed.data.forEach(entry => {
-      console.log(entry)
-      const target = labelMap[String(entry.category || "").trim().toLowerCase()];
-      if (!target) {
-        results.push(`${entry.transactionId}: "${entry.category}" isn't a valid category — left uncategorized.`);
-        return;
-      }
-      const outcome = resolveUnknownTransaction(entry.transactionId, target.targetSheet, target.targetField);
-      if (outcome.success) resolvedCount++;
-      results.push(outcome.success
-        ? `${entry.transactionId}: assigned to ${entry.category}.`
-        : `${entry.transactionId}: failed — ${outcome.error}`);
-
-      if (outcome.success && outcome.alsoResolved && outcome.alsoResolved.length > 0) {
-        outcome.alsoResolved.forEach(match => {
-          resolvedCount++;
-          results.push(`${match.transaction_id}: also assigned to ${entry.category} (same merchant/category as ${entry.transactionId}).`);
-        });
-      }
+    const detail = error && error.message ? error.message : String(error);
+    const reviewSheet = getFinanceSpreadsheet().getSheetByName(getPlaidReplacementReviewSheetName(itemId));
+    if (reviewSheet) reviewSheet.getRange(4, 2).setValue(`Finalization paused: ${detail}`);
+    console.error(`Plaid replacement finalization paused for Item ${itemId}: ${detail}`);
+    MailApp.sendEmail({
+      to: MY_EMAIL,
+      subject: `Plaid Replacement Finalization Needs Attention: ${itemId}`,
+      body:
+        `Finalization paused for Plaid Item ${itemId}:\n${detail}\n\n` +
+        `After correcting the issue, choose "Finalize replacement" again from cell B5.`
     });
-  };
-
-  if (results.length > 0) {
-    MailApp.sendEmail({ to: MY_EMAIL, subject: "Finance categorization update", body: results.join("\n") });
   }
+}
 
-  if (resolvedCount > 0) {
-    sendFinanceSummaryEmail();
+function sendPlaidReplacementFinalizationEmail(result) {
+  const sheetCleanup = result.review_sheet_deleted
+    ? "The replacement review sheet was deleted."
+    : `The replacement is complete, but its review sheet could not be deleted: ${result.review_sheet_delete_error}`;
+  try {
+    MailApp.sendEmail({
+      to: MY_EMAIL,
+      subject: `Plaid Item Replacement Completed: ${result.new_item_id}`,
+      body:
+        `Plaid Item replacement completed.\n` +
+        `Old Item: ${result.old_item_id}\n` +
+        `New Item: ${result.new_item_id}\n` +
+        `The new Item's access token and staged cursor are retained; the old Item's token and cursor were removed.\n` +
+        sheetCleanup
+    });
+  } catch (error) {
+    const detail = error && error.message ? error.message : String(error);
+    console.error(`Replacement completed, but its notification email could not be sent: ${detail}`);
   }
 }
