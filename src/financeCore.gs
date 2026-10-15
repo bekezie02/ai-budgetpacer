@@ -348,21 +348,31 @@ function findAllMonthSections(sheet) {
   return sections;
 }
 
-// Where each sheet's year-to-date rollup summary cells live (row 2, next to
-// January): Monthly LifeStyle Cost has "Annual LifeStyle Cost" in F2 and
-// "Savings" in G2; Monthly Mandatory Cost has "Annual Cost Ex Med & Car &
-// Renters" in H2 and "Savings" in I2. These are recomputed as the sum of
-// every month's actual (col B) and Budget-minus-Actual (col D) on the
-// Total Variable Costs row — replacing the manual entry that was prone to
-// drifting out of sync (e.g. one cell reflecting 2 months, the other 3).
+// Year-to-date totals live in row 2; row 1 labels identify the totals.
 const ANNUAL_ROLLUP_CELLS = {
-  [LIFESTYLE_SHEET]: { actual: "F2", savings: "G2" },
-  [MANDATORY_SHEET]: { actual: "H2", savings: "I2" }
+  [LIFESTYLE_SHEET]: {
+    actual: "F2",
+    savings: "G2",
+    actualLabel: "F1",
+    savingsLabel: "G1"
+  },
+  [MANDATORY_SHEET]: {
+    actual: "H2",
+    savings: "I2",
+    actualLabel: "H1",
+    savingsLabel: "I1"
+  }
 };
+
+function ensureAnnualRollupLabels(sheet, cells) {
+  sheet.getRange(cells.actualLabel).setValue("Actual Spending (YTD)");
+  sheet.getRange(cells.savingsLabel).setValue("Budget Remaining (YTD)");
+}
 
 function recomputeAnnualRollup(sheet, sheetName) {
   const cells = ANNUAL_ROLLUP_CELLS[sheetName];
   if (!cells) return; // sheet has no year-to-date rollup cells to maintain
+  ensureAnnualRollupLabels(sheet, cells);
 
   const sections = findAllMonthSections(sheet);
   let totalActual = 0;
@@ -594,9 +604,8 @@ function ensureMonthSection(sheetName, monthName) {
 
 function ensureMonthlyFinanceSheets(spreadsheet) {
   [LIFESTYLE_SHEET, MANDATORY_SHEET].forEach(sheetName => {
-    if (!spreadsheet.getSheetByName(sheetName)) {
-      spreadsheet.insertSheet(sheetName);
-    }
+    const sheet = spreadsheet.getSheetByName(sheetName) || spreadsheet.insertSheet(sheetName);
+    ensureAnnualRollupLabels(sheet, ANNUAL_ROLLUP_CELLS[sheetName]);
   });
 }
 
