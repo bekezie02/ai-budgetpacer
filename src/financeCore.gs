@@ -592,6 +592,14 @@ function ensureMonthSection(sheetName, monthName) {
   return { success: true, section: created.section, created: true };
 }
 
+function ensureMonthlyFinanceSheets(spreadsheet) {
+  [LIFESTYLE_SHEET, MANDATORY_SHEET].forEach(sheetName => {
+    if (!spreadsheet.getSheetByName(sheetName)) {
+      spreadsheet.insertSheet(sheetName);
+    }
+  });
+}
+
 /**
  * Entry point for the daily run: makes sure every month from January
  * through the current month has a section in both Monthly sheets
@@ -601,6 +609,7 @@ function ensureMonthSection(sheetName, monthName) {
  * month automatically. Also syncs the Medical/Car fixed pool.
  */
 function ensureMonthSectionsUpToDate() {
+  ensureMonthlyFinanceSheets(getFinanceSpreadsheet());
   syncFixedPoolsFromAnnualOverview();
 
   const monthsToDate = MONTH_NAMES.slice(0, new Date().getMonth() + 1); // getMonth() is 0-indexed (0 = January)
@@ -1913,6 +1922,7 @@ function startFreshFinanceSheet(newSpreadsheetName) {
 // =========================================================================
 function setupFinanceSheets() {
   const ss = getFinanceSpreadsheet();
+  ensureMonthlyFinanceSheets(ss);
   removeCategoryReplyTriggers();
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_THREAD_ID");
   financeScriptProperties.deleteProperty("PLAID_REPLACEMENT_APPROVAL_ITEM_ID");
@@ -1974,10 +1984,9 @@ function setupFinanceSheets() {
     Math.max(unknownSheet.getLastRow() - 1, 1)
   );
 
-  // Fixed pools (Travel + every category in the Mandatory Fixed Amounts
-  // block) are no longer scaffolded here — syncFixedPoolsFromAnnualOverview()
-  // creates each one automatically, sourcing its Annual Budget straight
-  // from Annual Overview, the first time ensureMonthSectionsUpToDate() runs.
+  if (ss.getSheetByName(ANNUAL_OVERVIEW_SHEET)) {
+    ensureMonthSectionsUpToDate();
+  }
 
-  console.log("Finance sheet setup complete. Transaction Ledger overrides, Uncategorized Transactions dropdowns, and the spreadsheet edit trigger are ready; fill in Category Rules and Annual Overview — Fixed pools are created automatically from it.");
+  console.log("Finance sheet setup complete. Monthly sheets and current-year month sections are ready; annual budgets also create the fixed pools. Transaction Ledger overrides, Uncategorized Transactions dropdowns, and the spreadsheet edit trigger are ready.");
 }
