@@ -1,0 +1,5 @@
+node_modules/
+.env
+PROJECT_CHANGES_GUIDE.md
+UNCATEGORIZED_TRANSACTION_FIX.md
+Automated_Low_Code_System_Architecture_Blueprint.md
